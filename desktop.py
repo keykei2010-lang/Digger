@@ -1,5 +1,7 @@
 """Portable desktop interface for the bundled Windows recovery engines."""
 import csv
+import hashlib
+import lzma
 from collections import Counter, deque
 import ctypes
 import os
@@ -25,7 +27,7 @@ from windows_volumes import is_elevated, local_volumes, require_separate_disk, s
 
 from media_preview import IMAGE_TYPES, VIDEO_TYPES, decode_preview
 from recycle_bin import ordinary, scan_recycle_bin
-from server import LOCK, RUNS, files_in, run_job, sample_image
+from server import LOCK, RUNS, files_in, run_job
 
 if os.name == "nt":
     runtime = Path(sys.executable).parent
@@ -134,6 +136,7 @@ class RecoveryWindow(tk.Tk):
         self.name_hint = tk.StringVar()
         self.page_number = 0
         self.page_size = 250
+        self.test_folders = []
         self.next_render = 0
         self.completed_job = None
         self.saving = False
@@ -212,6 +215,16 @@ class RecoveryWindow(tk.Tk):
                  fg=TEXT, padx=10, pady=12).pack(side="left")
         ttk.Checkbutton(top, text="Animations", variable=self.animate,
                         command=self.update_motion).pack(side="right", padx=20)
+        self.banner = tk.Frame(self, bg=PANEL, padx=20, pady=9)
+        self.banner.pack(fill="x")
+        self.stop_button = ttk.Button(self.banner, text="Cancel scan", command=self.stop_scan)
+        self.status_label = tk.Label(self.banner, bg=PANEL, fg=MUTED, text="Ready to scan",
+                                     font=("Segoe UI Semibold", 17), anchor="w")
+        self.status_label.pack(fill="x")
+        self.source_summary = ttk.Label(self.banner, background=PANEL, foreground=TEXT)
+        self.activity = ttk.Label(self.banner, background=PANEL, foreground=MUTED)
+        self.progress = ttk.Progressbar(self.banner, mode="indeterminate")
+        self.activity.pack(fill="x")
         body = ttk.Frame(self, padding=(20, 16))
         body.pack(fill="both", expand=True)
         style.layout("Workspace.TNotebook.Tab", [])
@@ -287,7 +300,7 @@ class RecoveryWindow(tk.Tk):
         self.source_label.pack(anchor="w", pady=(0, 10))
         actions = ttk.Frame(page)
         actions.pack(fill="x", pady=4)
-        self.demo = ttk.Button(actions, text="Try a sample scan", command=lambda: self.start_scan(True))
+        self.demo = ttk.Button(actions, text="Test deleted-file recovery", command=lambda: self.start_scan(True))
         self.demo.pack(side="left")
         self.elevation_button = ttk.Button(actions, text="Run as administrator", command=self.elevate)
         self.start_button = ttk.Button(actions, text="Scan for deleted files", style="Digger.TButton",
@@ -346,14 +359,8 @@ class RecoveryWindow(tk.Tk):
         ttk.Label(page, text="Recovery results", font=("Segoe UI Semibold", 23)).pack(anchor="w", pady=(0, 8))
         heading = ttk.Frame(page, padding=(12, 8))
         heading.pack(side="bottom", fill="x")
-        self.status_label = ttk.Label(heading, text="No scan yet", font=("Segoe UI Semibold", 12))
-        self.status_label.pack(anchor="w", side="left")
-        self.stop_button = ttk.Button(heading, text="Stop scan", command=self.stop_scan, state="disabled")
-        self.stop_button.pack(side="right", padx=(8, 0))
-        self.activity = ttk.Label(page, foreground=MUTED, anchor="w")
-        self.activity.pack(side="bottom", fill="x", padx=12, pady=(6, 0))
-        self.results_heading = self.activity
-        self.progress = ttk.Progressbar(page, mode="indeterminate", length=130)
+        self.save_status = ttk.Label(heading, foreground=TEXT)
+        self.save_status.pack(side="left")
         tools = ttk.Frame(page)
         tools.pack(fill="x", pady=10)
         ttk.Label(tools, text="Search").pack(side="left")
@@ -564,8 +571,8 @@ class RecoveryWindow(tk.Tk):
         if self.job is not None or self.saving:
             return
         mode = self.mode.get()
-        if sample and mode != "inspect":
-            mode = "recover"
+        if sample:
+            mode = "ntfs_image"
         source = None
         if not sample and mode != "bin":
             value = os.path.expandvars(self.source_text.get().strip().strip('"'))
@@ -588,10 +595,27 @@ class RecoveryWindow(tk.Tk):
                 if not source.is_file():
                     messagebox.showerror("Scan source", "Choose an existing disk image file.")
                     return
-        folder = Path(tempfile.mkdtemp(dir=RUNS.name))
+        if sample:
+            location = filedialog.askdirectory(title="Choose a healthy drive for the 48 MiB recovery test")
+            if not location:
+                return
+            try:
+                scratch = tempfile.TemporaryDirectory(prefix="Digger-Test-", dir=location)
+            except OSError as exc:
+                messagebox.showerror("Recovery test", str(exc))
+                return
+            self.test_folders.append(scratch)
+            folder = Path(scratch.name)
+        else:
+            folder = Path(tempfile.mkdtemp(dir=RUNS.name))
         self.job = {"folder": folder, "mode": mode, "status": "preparing", "matches": deque(),
-                    "started": monotonic(), "source": str(source or ("Recycle Bin" if mode == "bin" else "Sample image"))}
-        self.activity.configure(text=self.job["source"])
+                    "self_test": sample, "started": monotonic(), "source": str(source or ("Recycle Bin" if mode == "bin" else "Built-in NTFS test image"))}
+        self.source_summary.configure(text=self.job["source"])
+        self.source_summary.pack(before=self.activity, fill="x")
+        self.save_status.configure(text="")
+        self.activity.configure(text="Opening the scan source…")
+        self.stop_button.pack(before=self.status_label, side="right", padx=(10, 0))
+        self.stop_button.configure(text="Cancel scan", state="normal")
         self.preview_key = object()
         self.page_number = 0
         self.types.configure(values=("All file types",))
@@ -608,39 +632,62 @@ class RecoveryWindow(tk.Tk):
         self.recovery_checks.clear()
         self.preview_pending = None
         self.clear_filters()
-        self.search.set(self.name_hint.get().strip())
+        self.search.set("" if sample else self.name_hint.get().strip())
         self.set_log("")
-        self.status_label.configure(text="Starting scan…")
+        self.set_scan_status("Starting scan", "#91bdff")
         self.start_button.configure(state="disabled")
         self.demo.configure(state="disabled")
         self.tabs.select(self.results_page)
         self.update_motion()
         threading.Thread(target=self.scan, args=(self.job, None if sample else source), daemon=True).start()
 
+    def set_scan_status(self, text, color):
+        self.status_label.configure(text=text, fg=color)
+        self.title(f"{text}  ·  Digger")
+
     def scan(self, job, source):
-        if job["mode"] in ("bin", "folder"):
-            self.scan_bin(job, source if job["mode"] == "folder" else None)
-            return
-        if job["mode"] in ("live_ntfs", "ntfs_image"):
-            self.scan_indexed(job, source)
-            return
+        try:
+            with LOCK:
+                if job["status"] == "stopping":
+                    return
+                job["status"] = "running"
+            if job["self_test"]:
+                source = job["folder"] / "recovery-check.img"
+                with lzma.open(Path(__file__).with_name("recovery-check.img.xz")) as fixture, source.open("wb") as target:
+                    shutil.copyfileobj(fixture, target)
+            if job["mode"] in ("bin", "folder"):
+                self.scan_bin(job, source if job["mode"] == "folder" else None)
+            elif job["mode"] in ("live_ntfs", "ntfs_image"):
+                self.scan_indexed(job, source)
+            else:
+                self.scan_image(job, source)
+        except Exception as exc:
+            with LOCK:
+                if job["status"] != "stopping":
+                    job.update(status="failed", error=str(exc) or type(exc).__name__)
+        finally:
+            with LOCK:
+                if job["status"] == "stopping":
+                    job["status"] = "stopped"
+                elif job["status"] == "running":
+                    job["status"] = "complete"
+            self.events.put(job)
+
+    def scan_image(self, job, source):
         image = job["folder"] / "source.img"
         try:
-            if source is None:
-                sample_image(image)
-            else:
-                if not source.is_file() or not source.stat().st_size:
-                    raise OSError("Choose a non-empty raw disk image file.")
-                total = source.stat().st_size
-                job.update(status="running", copying=(0, total))
-                with source.open("rb") as src, image.open("wb") as dst:
-                    while chunk := src.read(4 * 1024 * 1024):
-                        if job["status"] == "stopping":
-                            job["status"] = "stopped"
-                            return
-                        dst.write(chunk)
-                        job["copying"] = dst.tell(), total
-                job.pop("copying", None)
+            if not source.is_file() or not source.stat().st_size:
+                raise OSError("Choose a non-empty raw disk image file.")
+            total = source.stat().st_size
+            job["copying"] = (0, total)
+            with source.open("rb") as src, image.open("wb") as dst:
+                while chunk := src.read(4 * 1024 * 1024):
+                    if job["status"] == "stopping":
+                        job["status"] = "stopped"
+                        return
+                    dst.write(chunk)
+                    job["copying"] = dst.tell(), total
+            job.pop("copying", None)
             image.chmod(0o400)
             with LOCK:
                 if job["status"] == "stopping":
@@ -653,8 +700,6 @@ class RecoveryWindow(tk.Tk):
                 for path in files_in(job):
                     if path.resolve() not in carved.seen:
                         job["matches"].append((path, None))
-        except OSError as exc:
-            job.update(status="failed", error=str(exc))
         finally:
             try:
                 if image.exists():
@@ -662,36 +707,28 @@ class RecoveryWindow(tk.Tk):
                     image.unlink()
             except OSError:
                 pass
-            finally:
-                self.events.put(job)
 
     def scan_bin(self, job, folder):
-        try:
-            job.update(status="running")
-            for source, original in scan_recycle_bin(folder):
-                if job["status"] == "stopping":
-                    break
-                job["matches"].append((source, original))
-            job["status"] = "stopped" if job["status"] == "stopping" else "complete"
-        except (OSError, subprocess.SubprocessError) as exc:
-            job.update(status="failed", error=str(exc))
-        finally:
-            self.events.put(job)
+        for source, original in scan_recycle_bin(folder, cancelled=lambda: job["status"] == "stopping"):
+            if job["status"] == "stopping":
+                return
+            job["matches"].append((source, original))
 
     def scan_indexed(self, job, source):
-        try:
-            scope = source if job["mode"] == "live_ntfs" else None
-            if scope is not None and os.name != "nt":
-                raise OSError("Live NTFS scans require Windows.")
-            volume = source_volume(scope) if scope is not None else str(source.resolve())
-            job.update(status="running")
-            for entry in scan_ntfs(volume, scope, job):
-                job["matches"].append((entry, entry.original))
-            job["status"] = "stopped" if job["status"] == "stopping" else "complete"
-        except (OSError, subprocess.SubprocessError) as exc:
-            job.update(status="failed", error=str(exc))
-        finally:
-            self.events.put(job)
+        scope = source if job["mode"] == "live_ntfs" else None
+        if scope is not None and os.name != "nt":
+            raise OSError("Live NTFS scans require Windows.")
+        volume = source_volume(scope) if scope is not None else str(source.resolve())
+        verified = False
+        for entry in scan_ntfs(volume, scope, job):
+            job["matches"].append((entry, entry.original))
+            if job["self_test"] and entry.original.parts[-2:] == ("Documents", "Important.bin"):
+                output = job["folder"] / "recovered.bin"
+                extract_ntfs(entry, output)
+                digest = hashlib.sha256(output.read_bytes()).hexdigest()
+                verified = digest == "833d518b36e9b97849398241881ea06f37c70ecb2d7b1c6d2af78c44ea2cb973"
+        if job["self_test"] and not verified and job["status"] != "stopping":
+            raise OSError("The recovery check could not reproduce the original file.")
 
     def refresh(self):
         job = self.job
@@ -712,7 +749,7 @@ class RecoveryWindow(tk.Tk):
                     self.progress.stop()
                 self.progress.configure(mode="determinate", maximum=max(1, total), value=done)
                 if not self.progress.winfo_manager():
-                    self.progress.pack(side="bottom", before=self.results_heading, fill="x", pady=(3, 0))
+                    self.progress.pack(fill="x", pady=(5, 0))
                 if copying:
                     stage = "Preparing image copy"
                     detail = f"   ·   {size_label(done)} / {size_label(total)}"
@@ -721,13 +758,13 @@ class RecoveryWindow(tk.Tk):
                     detail = f"   ·   {done:,} / {total:,} records"
             elif str(self.progress.cget("mode")) == "determinate":
                 self.update_motion()
-            if job["status"] == "running" and not self.saving:
-                self.status_label.configure(text=stage)
-                self.stop_button.configure(state="normal")
+            if job["status"] == "running":
+                percentage = f"  ·  {min(100, 100 * done // max(1, total))}%" if copying or records else ""
+                self.set_scan_status("Scanning" + percentage, "#91bdff")
             latest = ""
             if self.files:
                 latest = "   ·   Latest: " + self.display_path(next(reversed(self.files))).name
-            self.activity.configure(text=f"{job['source']}   ·   {len(self.files):,} files found{detail}   ·   {elapsed // 60}m {elapsed % 60:02}s{latest}")
+            self.activity.configure(text=f"{stage}   ·   {len(self.files):,} files found{detail}   ·   {elapsed // 60}m {elapsed % 60:02}s{latest}")
         if self.completed_job is None:
             try:
                 self.completed_job = self.events.get_nowait()
@@ -735,7 +772,9 @@ class RecoveryWindow(tk.Tk):
                 pass
         if self.completed_job is not None:
             if self.completed_job["matches"]:
-                self.status_label.configure(text="Adding results to the list")
+                self.stop_button.configure(state="disabled")
+                label = {"stopped": "Scan canceled", "complete": "Scan finished", "failed": "Scan failed"}
+                self.set_scan_status(label[self.completed_job["status"]] + "  ·  Listing results", MUTED)
             else:
                 completed, self.completed_job = self.completed_job, None
                 self.finish_scan(completed)
@@ -789,8 +828,13 @@ class RecoveryWindow(tk.Tk):
             self.render_files()
 
     def finish_scan(self, job):
-        labels = {"complete": "Scan complete", "stopped": "Scan stopped", "failed": "Scan failed"}
-        self.status_label.configure(text=labels[job["status"]])
+        labels = {"complete": ("Scan complete", "#92dfa6"), "stopped": ("Scan canceled", "#f8cb83"),
+                  "failed": ("Scan failed", "#ffa8a8")}
+        title, color = labels[job["status"]]
+        if job["status"] == "complete" and job["self_test"]:
+            title = "Recovery test passed"
+        self.set_scan_status(title, color)
+        self.stop_button.pack_forget()
         self.stop_button.configure(state="disabled")
         self.job = None
         self.demo.configure(state="disabled" if self.saving else "normal")
@@ -802,15 +846,22 @@ class RecoveryWindow(tk.Tk):
         indexed = job["mode"] in ("live_ntfs", "ntfs_image")
         elapsed = int(monotonic() - job["started"])
         detail = f"   ·   {job['records'][0]:,} records examined" if job.get("records") else ""
-        self.activity.configure(text=f"{job['source']}   ·   {len(self.files):,} files found{detail}   ·   {elapsed // 60}m {elapsed % 60:02}s")
+        summary = f"{len(self.files):,} files found{detail}   ·   {elapsed // 60}m {elapsed % 60:02}s"
+        if job["status"] == "stopped":
+            summary += "   ·   Scanning has stopped. Partial results are available."
+        elif job.get("error"):
+            summary = job["error"].splitlines()[0]
+        elif job["self_test"]:
+            summary = "Recovered Documents\\Important.bin from the test image and verified all 12,032 bytes."
+        self.activity.configure(text=summary)
         if job.get("error"):
             messagebox.showerror("Scan", job["error"])
         if indexed and not self.files and job["status"] == "complete":
-            self.status_label.configure(text="No matching deleted files")
+            self.set_scan_status("Scan complete  ·  No deleted records found", color)
             self.set_log("No matching deleted filesystem records survived in the selected source. "
                          "If you scanned a folder, try the whole drive. A deep scan needs a raw disk image.")
         if is_bin and not self.files and job["status"] == "complete":
-            self.status_label.configure(text="No matching items in the Recycle Bin")
+            self.set_scan_status("Scan complete  ·  No matching Recycle Bin items", color)
         log = job["folder"] / "output.log"
         if log.exists():
             with log.open("rb") as stream:
@@ -842,8 +893,8 @@ class RecoveryWindow(tk.Tk):
     def update_motion(self):
         self.progress.stop()
         self.progress.configure(mode="indeterminate")
-        if (self.job is not None or self.saving) and self.animate.get():
-            self.progress.pack(side="bottom", before=self.results_heading, fill="x", pady=(3, 0))
+        if self.job is not None and self.animate.get():
+            self.progress.pack(fill="x", pady=(5, 0))
             self.progress.start(16)
         else:
             self.progress.pack_forget()
@@ -1271,7 +1322,7 @@ class RecoveryWindow(tk.Tk):
             messagebox.showerror("Recover selected files", str(exc))
             return
         self.saving = True
-        self.status_label.configure(text="Recovering selected files…")
+        self.save_status.configure(text="Recovering selected files…")
         self.export_button.configure(state="disabled")
         self.demo.configure(state="disabled")
         self.update_source()
@@ -1316,7 +1367,7 @@ class RecoveryWindow(tk.Tk):
         self.materialized.update(materialized)
         self.recovery_checks.update(evidence)
         self.saving = False
-        self.status_label.configure(text=f"Recovered {saved} of {count} selected files")
+        self.save_status.configure(text=f"Recovered {saved} of {count} selected files")
         self.demo.configure(state="disabled" if self.saving or self.job is not None else "normal")
         self.update_source()
         self.update_motion()
@@ -1332,7 +1383,7 @@ class RecoveryWindow(tk.Tk):
 
     def stop_scan(self):
         with LOCK:
-            if self.job is None or self.job["status"] != "running":
+            if self.job is None or self.job["status"] not in ("running", "preparing"):
                 return
             self.job["status"] = "stopping"
             if self.job.get("process"):
@@ -1341,14 +1392,15 @@ class RecoveryWindow(tk.Tk):
                 except OSError:
                     pass
         self.stop_button.configure(state="disabled")
-        self.status_label.configure(text="Stopping scan…")
+        self.stop_button.configure(text="Cancel requested")
+        self.set_scan_status("Canceling scan…", "#f8cb83")
 
     def close(self):
         if self.saving:
             messagebox.showinfo("Recovery in progress", "Wait for the selected files to finish saving.")
             return
         if self.job is not None:
-            messagebox.showinfo("Scan in progress", "Wait for the scan to finish or click Stop scan.")
+            messagebox.showinfo("Scan in progress", "Wait for the scan to finish or click Cancel scan.")
             return
         self.destroy()
 

@@ -8,7 +8,7 @@ Extract the ZIP and run **Digger.exe**. The x64 desktop app runs offline. Keep t
 - **Recycle Bin** lists files Windows still holds in your Recycle Bin. Use **More scans → Recycle Bin by folder** to limit the search to the original folder.
 - **Disk image** lists deleted records in raw NTFS, FAT12/16/32, and exFAT volume or partitioned disk images. When the metadata survives, results retain the filesystem name and parent path. The app reads the image in place and extracts only the files you select. Keep the image unchanged between scan and recovery.
 - **Deep scan image** uses PhotoRec to carve files from a raw disk image. It can find data after filesystem metadata is gone. PhotoRec assigns new filenames. This workflow needs temporary space for a read-only copy of the image and recovered files.
-- **Inspect image** lists partitions with TestDisk. **Try a sample scan** lets you test PhotoRec without supplying an image.
+- **Inspect image** lists partitions with TestDisk. **Test deleted-file recovery** opens a synthetic NTFS image in a temporary folder on a healthy drive you choose, recovers a known deleted file, and compares its SHA-256 digest with the original. The scan banner stays visible on both Locations and Results. Canceling changes to Scan canceled after the worker exits. Partial results remain available.
 
 ## Select and recover
 

@@ -79,14 +79,21 @@ def payload_files(path):
                 yield child
 
 
-def scan_recycle_bin(folder=None, bins=None):
+def scan_recycle_bin(folder=None, bins=None, cancelled=lambda: False):
     scope = PureWindowsPath(folder) if folder else None
     for bin_path in current_user_bins() if bins is None else bins:
         try:
-            records = [record for record in bin_path.iterdir() if record.name.startswith("$I")]
+            records = []
+            for record in bin_path.iterdir():
+                if cancelled():
+                    return
+                if record.name.startswith("$I"):
+                    records.append(record)
         except (FileNotFoundError, PermissionError, NotADirectoryError):
             continue
         for record in records:
+            if cancelled():
+                return
             try:
                 if not ordinary(record):
                     continue
@@ -97,6 +104,8 @@ def scan_recycle_bin(folder=None, bins=None):
                     continue
                 payload = record.with_name("$R" + record.name[2:])
                 for source in payload_files(payload):
+                    if cancelled():
+                        return
                     target = original.joinpath(*source.relative_to(payload).parts)
                     if scope is None or target.is_relative_to(scope):
                         yield source, target

@@ -67,13 +67,20 @@ def body_entry(line, source, offset, volume, fingerprint, filesystem="ntfs"):
     return Candidate(source, offset, inode, PureWindowsPath(prefix, *parts), size, modified, fingerprint, filesystem)
 
 
-def partition_offsets(source):
+def partition_offsets(source, job):
     with tool("mmls", ["-i", "raw", source], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as process:
+        with LOCK:
+            job["process"] = process
+            if job["status"] == "stopping":
+                process.terminate()
         try:
             output, _ = process.communicate(timeout=25)
         except subprocess.TimeoutExpired:
             process.kill()
             output, _ = process.communicate()
+        finally:
+            with LOCK:
+                job.pop("process", None)
     return sorted({int(match[1]) for line in output.decode("utf-8", "replace").splitlines()
                    if (match := re.match(r"^\s*\d+:\s+[0-9]+(?::[0-9]+)?\s+(\d+)\s+\d+\s+\d+", line))
                    and int(match[1]) > 0})
@@ -100,7 +107,7 @@ def filesystem_at(source, offset):
 
 def scan(source, scope, job):
     fingerprint = None if scope is not None else identity(source)
-    offsets = [0] if scope is not None else [0, *partition_offsets(source)]
+    offsets = [0] if scope is not None else [0, *partition_offsets(source, job)]
     readable = False
     messages = []
     seen = set()
