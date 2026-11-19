@@ -1,1 +1,1 @@
-e8021b1b964cc2ea4d63c639e6a9cbadf19ce311d2045c090b319cf64658cd9e  Digger-Windows-x64.zip
+71d79c6332e7b7e6b95cfd8eb02a4b593860db7a8ffb8e9305f6ff9cc545560c  Digger-Windows-x64.zip
