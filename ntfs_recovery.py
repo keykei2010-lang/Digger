@@ -1,11 +1,12 @@
 """Indexed, read-only undelete using the bundled Sleuth Kit command-line tools."""
 from dataclasses import dataclass
 from functools import lru_cache
+from io import BytesIO
 import os
 from pathlib import Path, PureWindowsPath
 import re
 import subprocess
-import tempfile
+from threading import Thread
 from recovery_output import atomic_output
 from server import LOCK
 
@@ -55,9 +56,6 @@ def body_entry(line, source, offset, volume, fingerprint, filesystem="ntfs"):
         return None
     parts = header[3:-len(BODY_SUFFIX)].split("/")
     if not all(safe_name(part) for part in parts):
-        return None
-    # A virtual orphan directory is not original filesystem ancestry.
-    if parts[0] == "$OrphanFiles" and volume.endswith(":"):
         return None
     try:
         size, modified = int(size), int(modified)
@@ -112,39 +110,53 @@ def scan(source, scope, job):
         filesystem = "ntfs" if scope is not None else filesystem_at(source, offset)
         if filesystem is None:
             continue
-        result = []
-        with tempfile.SpooledTemporaryFile(max_size=131072) as errors:
-            arguments = ["-i", "raw", "-f", filesystem, "-o", str(offset), "-r", "-d", "-F", "-m", "/", source]
-            with tool("fls", arguments, stdout=subprocess.PIPE, stderr=errors if scope is None else subprocess.DEVNULL) as process:
-                with LOCK:
-                    job["process"] = process
-                    if job["status"] == "stopping":
-                        process.terminate()
-                volume = scope.drive if scope is not None else (f"Partition-{offset}" if offset else "Image")
-                for raw in process.stdout:
-                    row = body_entry(raw.decode("utf-8", "replace"), source, offset, volume, fingerprint, filesystem)
-                    if row and (scope is None or row.original.is_relative_to(scope)):
-                        result.append(row)
-                code = process.wait()
-                with LOCK:
-                    job.pop("process", None)
-            if not code:
-                readable = True
-            else:
-                errors.seek(0)
-                messages.append(errors.read(2048).decode("utf-8", "replace").strip())
-        if code and job["status"] != "stopping":
-            continue
-        for row in result:
-            key = row.offset, row.inode, row.original
-            if key not in seen:
-                seen.add(key)
-                yield row
-    if not readable and job["status"] != "stopping":
+        errors = bytearray()
+        arguments = ["-i", "raw", "-f", filesystem, "-o", str(offset), "-r", "-d", "-F", "-m", "/", source]
+        if os.name == "nt" and filesystem == "ntfs":
+            arguments.insert(0, "-Q")
+        with tool("fls", arguments, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process:
+            def drain_errors():
+                for chunk in iter(lambda: process.stderr.read(4096), b""):
+                    errors.extend(chunk[:max(0, 2048 - len(errors))])
+
+            reader = Thread(target=drain_errors)
+            reader.start()
+            with LOCK:
+                job["process"] = process
+                if job["status"] == "stopping":
+                    process.terminate()
+            volume = scope.drive if scope is not None else (f"Partition-{offset}" if offset else "Image")
+            for raw in process.stdout:
+                if raw.startswith(b"MFT "):
+                    current, total = map(int, raw.split()[1:])
+                    job["records"] = current, total
+                    continue
+                row = body_entry(raw.decode("utf-8", "replace"), source, offset, volume, fingerprint, filesystem)
+                if row is None:
+                    continue
+                if scope is not None and not row.original.is_relative_to(scope):
+                    continue
+                if scope is not None and row.original.parts[1:2] and row.original.parts[1].casefold() == "$recycle.bin":
+                    # Cleared-bin payload records can survive under their Windows $R name.
+                    if not any(part.casefold().startswith("$r") for part in row.original.parts[2:]):
+                        continue
+                key = row.offset, row.inode, row.original
+                if key not in seen:
+                    seen.add(key)
+                    yield row
+            code = process.wait()
+            reader.join()
+            with LOCK:
+                job.pop("process", None)
+        if not code:
+            readable = True
+        else:
+            messages.append(errors.decode("utf-8", "replace").strip())
+    if (not readable or any(messages)) and job["status"] != "stopping":
         detail = next((message for message in messages if message), "")
         hint = ("The selected volume must be NTFS and the app must run as administrator."
                 if scope is not None else "Choose a raw disk or volume image containing NTFS, FAT, or exFAT.")
-        raise OSError("Could not read a supported filesystem. " + hint + ("\n" + detail if detail else ""))
+        raise OSError("The filesystem scan did not finish. " + hint + ("\n" + detail if detail else ""))
 
 
 def check_identity(entry):
@@ -163,8 +175,12 @@ def ntfs_record(entry):
             raise OSError("Timed out checking the deleted NTFS record.") from None
     if process.returncode or b"Not Allocated File" not in output.splitlines():
         raise OSError("The deleted record is no longer available. Scan the drive again.")
-    if not any(line.strip().decode("utf-8", "replace").casefold() == f"name: {entry.original.name}".casefold()
-               for line in output.splitlines()):
+    virtual_name = ("$OrphanFiles" in entry.original.parts and
+                    entry.original.name == f"OrphanFile-{entry.inode.split('-')[0]}")
+    if not virtual_name and not any(
+        line.strip().decode("utf-8", "replace").casefold() == f"name: {entry.original.name}".casefold()
+        for line in output.splitlines()
+    ):
         raise OSError("The deleted NTFS entry name changed. Scan the drive again.")
     fields = output.splitlines()
     attribute = entry.inode.split("-", 1)[1].encode()
@@ -243,30 +259,44 @@ def ensure_current(entry):
         ntfs_record(entry)
 
 
-def extract(entry, output):
+def stream_recovery(entry, target):
     before, evidence = recovery_evidence(entry)
     arguments = ["-r", "-i", "raw", "-f", entry.filesystem, "-o", str(entry.offset), entry.source, entry.inode]
+    with tool("icat", arguments, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as process:
+        remaining = entry.st_size
+        try:
+            for chunk in iter(lambda: process.stdout.read(1024 * 1024), b""):
+                if len(chunk) > remaining:
+                    raise OSError("The recovered data exceeded the expected size.")
+                target.write(chunk)
+                remaining -= len(chunk)
+            if process.wait() or remaining:
+                raise OSError("The engine could not read all bytes for this file.")
+        finally:
+            if process.poll() is None:
+                process.kill()
+    if entry.identity is None:
+        after, evidence = recovery_evidence(entry)
+        if before != after:
+            raise OSError("The deleted record changed during recovery. Scan the drive again.")
+    else:
+        check_identity(entry)
+    return evidence
+
+
+def preview_bytes(entry, limit):
+    if entry.st_size > limit:
+        raise OSError("This image is too large for an in-memory preview.")
+    output = BytesIO()
+    stream_recovery(entry, output)
+    output.seek(0)
+    return output
+
+
+def extract(entry, output):
     with atomic_output(output) as staging:
         with staging.open("wb") as target:
-            with tool("icat", arguments, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as process:
-                remaining = entry.st_size
-                try:
-                    for chunk in iter(lambda: process.stdout.read(1024 * 1024), b""):
-                        if len(chunk) > remaining:
-                            raise OSError("The recovered data exceeded the expected size.")
-                        target.write(chunk)
-                        remaining -= len(chunk)
-                    if process.wait() or remaining:
-                        raise OSError("The engine could not read all bytes for this file.")
-                finally:
-                    if process.poll() is None:
-                        process.kill()
-        if entry.identity is None:
-            after, evidence = recovery_evidence(entry)
-            if before != after:
-                raise OSError("The deleted record changed during recovery. Scan the drive again.")
-        else:
-            check_identity(entry)
+            evidence = stream_recovery(entry, target)
         if entry.st_mtime > 0:
             try:
                 os.utime(staging, (entry.st_mtime, entry.st_mtime))

@@ -1,6 +1,6 @@
 # Digger
 
-Digger is a portable, offline Windows x64 data recovery app. Scan the Recycle Bin, look for deleted filesystem records in disk images, or use PhotoRec for a deep image scan. Browse by original folder or file type, preview media, and recover selected files to a destination you choose.
+Digger is a portable, offline Windows x64 data recovery app. Scan a mounted NTFS drive or original folder for deleted records, recover files held in the Recycle Bin, or scan a raw disk image. Browse by original folder or file type, preview media, and recover selected files to a destination you choose.
 
 See [Windows usage](WINDOWS.md) for supported sources, recovery checks, and current limits. Live NTFS folder recovery requires administrator access, a separate physical destination disk, and testing on native Windows.
 

@@ -8,7 +8,6 @@ button:focus-visible,input:focus-visible,select:focus-visible,a:focus-visible,su
 [hidden]{display:none!important}
 .topbar{height:68px;padding:0 34px;display:flex;justify-content:space-between;align-items:center;background:var(--dark);color:#fff}
 .brand{display:flex;align-items:center;gap:7px;font-size:20px;letter-spacing:-.5px;font-weight:700}
-.brand strong{color:#a4bcb4;font-weight:500}
 .brand-mark{display:grid;place-items:center;border-radius:10px;width:35px;height:35px;color:#173a30;background:var(--mint);font-size:24px;margin-right:5px}
 .local{color:#d3e5df;font-size:13px;display:flex;align-items:center;gap:8px;border:1px solid #36504e;padding:7px 11px;border-radius:30px}
 i,#status-dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:#98aaa4;flex:none}
@@ -25,8 +24,6 @@ nav{display:grid;gap:5px}
 main{width:min(100%,1220px);padding:35px clamp(22px,4.1vw,58px) 24px;margin:0 auto}
 .hero{background:radial-gradient(ellipse at 88% 58%,#205650 0%,#143736 38%,var(--navy) 70%);color:#fff;border-radius:19px;min-height:248px;padding:39px 36px;position:relative;overflow:hidden;display:flex;align-items:center}
 .hero>div:first-child{position:relative;z-index:1}
-.eyebrow{display:flex;align-items:center;gap:9px;font-size:11px;font-weight:750;letter-spacing:.16em;color:#9de7c6;margin:0 0 15px}
-.eyebrow span{width:17px;height:1px;background:currentColor}
 h1,h2,p{margin-top:0}
 h1{font-size:clamp(35px,4vw,59px);letter-spacing:-.065em;line-height:1.03;margin-bottom:14px}
 .hero p:last-child{color:#d0e2db;max-width:390px;line-height:1.65;margin:0;font-size:15px}

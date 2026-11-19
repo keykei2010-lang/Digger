@@ -8,6 +8,8 @@ Release source archive SHA-256:
 
 The x64 utilities were built from the included archive for raw-image and
 Windows-volume use, with optional image-format dependencies disabled:
+  patch -p1 < tsk-windows-volume-length.patch
+  patch -p1 < tsk-live-scan.patch
   ./configure --host=x86_64-w64-mingw32 --disable-java --disable-cppunit \
     --enable-offline --disable-shared LDFLAGS="-static"
   make

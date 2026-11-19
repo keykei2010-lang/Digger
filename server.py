@@ -52,7 +52,7 @@ def sample_image(path):
             disk.write(png)
 
 
-def run_job(job):
+def run_job(job, on_progress=None):
     folder = job["folder"]
     commands = {
         "inspect": [str(engine_path("testdisk")), "/list", "source.img"],
@@ -73,7 +73,16 @@ def run_job(job):
                 job["process"] = process
                 if job["status"] == "stopping":
                     process.terminate()
-            code = process.wait()
+            if on_progress is None:
+                code = process.wait()
+            else:
+                while True:
+                    try:
+                        code = process.wait(timeout=0.35)
+                        break
+                    except subprocess.TimeoutExpired:
+                        on_progress()
+                on_progress()
         with LOCK:
             job["status"] = ("stopped" if job["status"] == "stopping"
                              else "complete" if code == 0 else "failed")

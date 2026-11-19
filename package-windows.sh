@@ -8,9 +8,9 @@ stage=$(mktemp -d)
 trap 'rm -rf "$stage"' EXIT
 root="$stage/Digger"
 mkdir -p "$root"/{runtime/sleuthkit,engines/63,source,licenses}
-cp "$project"/{desktop.py,server.py,media_preview.py,recycle_bin.py,ntfs_recovery.py,windows_volumes.py,recovery_output.py} "$root"
+cp "$project"/{desktop.py,server.py,carved_results.py,media_preview.py,recycle_bin.py,ntfs_recovery.py,windows_volumes.py,recovery_output.py} "$root"
 cp "$project/WINDOWS.md" "$root/Read me.md"
-cp "$project/launcher-win.c" "$root/source"
+cp "$project/launcher-win.c" "$project/tsk-windows-volume-length.patch" "$project/tsk-live-scan.patch" "$root/source"
 compiler=${MINGW_CC:-"$inputs/mingw/usr/bin/x86_64-w64-mingw32-gcc-posix"}
 "$compiler" -Os -s -mwindows "$project/launcher-win.c" -o "$root/Digger.exe"
 unzip -q "$inputs/python.zip" -d "$root/runtime"

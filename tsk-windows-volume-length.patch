@@ -1,0 +1,72 @@
+--- a/tsk/util/file_system_utils.c
++++ b/tsk/util/file_system_utils.c
+@@ -139,40 +139,39 @@
+ 			}
+ 		}
+ 		else {
+-
+-			//use GET_PARTITION_INFO_EX prior to IOCTL_DISK_GET_DRIVE_GEOMETRY
+-			// to determine the physical disk size because
+-			//calculating it with the help of GET_DRIVE_GEOMETRY gives only
+-			// approximate number
+-			DWORD junk;
+-
++			// Query the exact volume length before using partition or geometry estimates.
++			DWORD returned = 0;
++			GET_LENGTH_INFORMATION length;
+ 			PARTITION_INFORMATION_EX partition;
+-			if (FALSE == DeviceIoControl(fd,
+-				IOCTL_DISK_GET_PARTITION_INFO_EX,
+-				NULL, 0, &partition, sizeof(partition), &junk,
+-				(LPOVERLAPPED)NULL)) {
+-				DISK_GEOMETRY pdg;
+-
+-				if (FALSE == DeviceIoControl(fd, IOCTL_DISK_GET_DRIVE_GEOMETRY,
+-					NULL, 0, &pdg, sizeof(pdg), &junk, (LPOVERLAPPED)NULL)) {
+-					int lastError = (int)GetLastError();
+-					tsk_error_reset();
+-					tsk_error_set_errno(TSK_ERR_IMG_OPEN);
+-					tsk_error_set_errstr("raw_open: file \"%" PRIttocTSK
+-						"\" - DeviceIoControl: %d", a_file,
+-						lastError);
+-					size = -1;
+-				}
+-				else {
+-					size = pdg.Cylinders.QuadPart *
+-						(TSK_OFF_T)pdg.TracksPerCylinder *
+-						(TSK_OFF_T)pdg.SectorsPerTrack *
+-						(TSK_OFF_T)pdg.BytesPerSector;
+-				}
++			DISK_GEOMETRY geometry;
++			LARGE_INTEGER file_size;
++			if (DeviceIoControl(fd, IOCTL_DISK_GET_LENGTH_INFO, NULL, 0,
++				&length, sizeof(length), &returned, NULL) &&
++				returned >= sizeof(length) && length.Length.QuadPart > 0) {
++				size = length.Length.QuadPart;
+ 			}
+-			else {
++			else if (DeviceIoControl(fd, IOCTL_DISK_GET_PARTITION_INFO_EX, NULL, 0,
++				&partition, sizeof(partition), &returned, NULL) &&
++				returned >= sizeof(partition) && partition.PartitionLength.QuadPart > 0) {
+ 				size = partition.PartitionLength.QuadPart;
+ 			}
++			else if (GetFileSizeEx(fd, &file_size) && file_size.QuadPart > 0) {
++				size = file_size.QuadPart;
++			}
++			else if (DeviceIoControl(fd, IOCTL_DISK_GET_DRIVE_GEOMETRY, NULL, 0,
++				&geometry, sizeof(geometry), &returned, NULL) &&
++				returned >= sizeof(geometry)) {
++				size = geometry.Cylinders.QuadPart * (TSK_OFF_T)geometry.TracksPerCylinder *
++					(TSK_OFF_T)geometry.SectorsPerTrack * (TSK_OFF_T)geometry.BytesPerSector;
++			}
++
++			if (size <= 0) {
++				tsk_error_reset();
++				tsk_error_set_errno(TSK_ERR_IMG_OPEN);
++				tsk_error_set_errstr("raw_open: could not determine a positive length for "
++					"Windows volume \"%" PRIttocTSK "\"", a_file);
++				size = -2;
++			}
+ 		}
+ 
+ 		CloseHandle(fd);

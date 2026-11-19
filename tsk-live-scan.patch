@@ -1,0 +1,110 @@
+--- a/tools/fstools/fls.cpp
++++ b/tools/fstools/fls.cpp
+@@ -23,6 +23,72 @@
+ #include "tsk/fs/apfs_fs.h"
+ #include <locale.h>
+ #include <time.h>
++
++// Digger's indexed scan reads metadata in record order, including deleted directories.
++#include <map>
++#include <string>
++typedef std::pair<TSK_INUM_T, uint32_t> DirectoryRef;
++struct ScanContext {
++    std::map<DirectoryRef, std::string> directories;
++};
++
++static std::string directory_path(TSK_FS_INFO *fs, const TSK_FS_META_NAME_LIST *name,
++                                  ScanContext &context, unsigned depth)
++{
++    if (name->par_inode == fs->root_inum) return "";
++    if (depth >= 128) return "$OrphanFiles/";
++    DirectoryRef ref(name->par_inode, name->par_seq);
++    auto cached = context.directories.find(ref);
++    if (cached != context.directories.end()) return cached->second;
++    std::string path = "$OrphanFiles/";
++    TSK_FS_FILE *parent = tsk_fs_file_open_meta(fs, NULL, name->par_inode);
++    if (parent && parent->meta && parent->meta->type == TSK_FS_META_TYPE_DIR) {
++        const auto *meta = parent->meta;
++        uint32_t seq = meta->seq;
++        if ((meta->flags & TSK_FS_META_FLAG_UNALLOC) && seq) --seq;
++        if (seq == ref.second && meta->name2 && meta->name2->par_inode != ref.first)
++            path = directory_path(fs, meta->name2, context, depth + 1) + meta->name2->name + "/";
++    }
++    if (parent) tsk_fs_file_close(parent);
++    else tsk_error_reset();
++    context.directories[ref] = path;
++    return path;
++}
++
++static TSK_WALK_RET_ENUM deleted_record(TSK_FS_FILE *file, void *opaque)
++{
++    const auto *meta = file->meta;
++    if (!meta || meta->type != TSK_FS_META_TYPE_REG) return TSK_WALK_CONT;
++    auto &context = *static_cast<ScanContext *>(opaque);
++    const auto *data = tsk_fs_file_attr_get_type(file, TSK_FS_ATTR_TYPE_NTFS_DATA, 0, 0);
++    if (!data || data->name) { tsk_error_reset(); return TSK_WALK_CONT; }
++    for (auto *name = meta->name2; name; name = name->next) {
++        std::string path = directory_path(file->fs_info, name, context, 0) + name->name;
++        if (path.find_first_of("\r\n|") != std::string::npos) continue;
++        printf("0|/%s (deleted)|%" PRIuINUM "-128-%u|r/r|0|0|%" PRIdOFF "|0|%lld|0|0\n",
++               path.c_str(), meta->addr, unsigned(data->id), data->size, (long long)meta->mtime);
++        fflush(stdout);
++    }
++    return TSK_WALK_CONT;
++}
++
++static int scan_deleted_records(TSK_FS_INFO *fs)
++{
++    ScanContext context;
++    // last_inum is TSK's virtual orphan directory.
++    for (TSK_INUM_T pos = fs->first_inum; pos < fs->last_inum;) {
++        printf("MFT %llu %llu\n", (unsigned long long)pos, (unsigned long long)fs->last_inum);
++        fflush(stdout);
++        TSK_INUM_T next = std::min(pos + 256, fs->last_inum);
++        if (fs->inode_walk(fs, pos, next - 1, (TSK_FS_META_FLAG_ENUM)
++                (TSK_FS_META_FLAG_UNALLOC | TSK_FS_META_FLAG_USED), deleted_record, &context))
++            return 1;
++        pos = next;
++    }
++    printf("MFT %llu %llu\n", (unsigned long long)fs->last_inum, (unsigned long long)fs->last_inum);
++    fflush(stdout);
++    return 0;
++}
+ 
+ static TSK_TCHAR *progname;
+ 
+@@ -91,6 +157,7 @@
+     int ch;
+     extern int OPTIND;
+     int fls_flags;
++    bool indexed_scan = false;
+     int32_t sec_skew = 0;
+     static TSK_TCHAR *macpre = NULL;
+     TSK_TCHAR **argv;
+@@ -118,13 +185,16 @@
+     fls_flags = TSK_FS_FLS_DIR | TSK_FS_FLS_FILE;
+ 
+     while ((ch =
+-            GETOPT(argc, argv, _TSK_T("ab:dDf:Fi:m:hlo:prs:uvVz:P:B:k:S:"))) > 0) {
++            GETOPT(argc, argv, _TSK_T("Qab:dDf:Fi:m:hlo:prs:uvVz:P:B:k:S:"))) > 0) {
+         switch (ch) {
+         case _TSK_T('?'):
+         default:
+             TFPRINTF(stderr, _TSK_T("Invalid argument: %" PRIttocTSK "\n"),
+                 argv[OPTIND]);
+             usage();
++            break;
++        case _TSK_T('Q'):
++            indexed_scan = true;
+             break;
+         case _TSK_T('a'):
+             fls_flags |= TSK_FS_FLS_DOT;
+@@ -401,7 +471,7 @@
+         tsk_apfs_set_snapshot(fs, (uint64_t)snap_id);
+     }
+ 
+-    if (tsk_fs_fls(fs, (TSK_FS_FLS_FLAG_ENUM) fls_flags, inode,
++    if (indexed_scan ? scan_deleted_records(fs) : tsk_fs_fls(fs, (TSK_FS_FLS_FLAG_ENUM) fls_flags, inode,
+             (TSK_FS_DIR_WALK_FLAG_ENUM) name_flags, macpre, sec_skew)) {
+         tsk_error_print(stderr);
+         tsk_fs_close(fs);
