@@ -1,0 +1,14 @@
+The Sleuth Kit 4.15.0 is supplied as separate utilities for read-only NTFS
+listing, partition detection and extraction. No code from the four reviewed
+forks is included.
+
+Source: https://github.com/sleuthkit/sleuthkit/releases/tag/sleuthkit-4.15.0
+Release source archive SHA-256:
+3a8c1e7d18a9b81f3e5e8aa78313974aceaafc6e051d636bc92cd7168286eca9
+
+The x64 utilities were built from the included archive for raw-image and
+Windows-volume use, with optional image-format dependencies disabled:
+  ./configure --host=x86_64-w64-mingw32 --disable-java --disable-cppunit \
+    --enable-offline --disable-shared LDFLAGS="-static"
+  make
+See the included source archive and license files for the applicable terms.

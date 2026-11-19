@@ -1,0 +1,8 @@
+FFmpeg 7.1 for Windows x86-64 is shipped as a separate executable for
+generating video thumbnails. It comes from the imageio-ffmpeg 0.6.0 wheel.
+
+Package: https://pypi.org/project/imageio-ffmpeg/0.6.0/
+Build recipes: https://github.com/imageio/imageio-binaries
+FFmpeg source: https://ffmpeg.org/releases/ffmpeg-7.1.tar.xz
+FFmpeg license information: https://ffmpeg.org/legal.html
+GNU GPL v3 text: https://www.gnu.org/licenses/gpl-3.0.txt

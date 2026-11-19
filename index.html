@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Digger</title>
+  <link rel="stylesheet" href="/app.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+<header class="topbar">
+  <div class="brand"><span class="brand-mark" aria-hidden="true">◫</span> Digger</div>
+  <span class="local"><i></i> Local workspace</span>
+</header>
+<div class="layout">
+  <aside class="rail">
+    <div class="rail-label">WORKSPACE</div>
+    <nav aria-label="Workspace">
+      <button id="scan-nav" class="nav active" type="button"><span aria-hidden="true">⊞</span> New scan</button>
+      <button id="results-nav" class="nav" type="button"><span aria-hidden="true">▤</span> Scan results</button>
+    </nav>
+    <div class="engines">
+      <div class="rail-label">RECOVERY ENGINES</div>
+      <div><i id="testdisk-status"></i> TestDisk</div>
+      <div><i id="photorec-status"></i> PhotoRec</div>
+    </div>
+  </aside>
+  <main>
+    <section id="scan-view">
+      <div class="hero">
+        <div>
+          <p class="eyebrow"><span></span> DATA RECOVERY WORKSPACE</p>
+          <h1>Find your files again.</h1>
+          <p>Inspect partitions and recover files from a disk image using TestDisk and PhotoRec.</p>
+        </div>
+        <div class="hero-art" aria-hidden="true">
+          <div class="orb"></div><div class="orbit"></div>
+          <div class="drive d3"></div><div class="drive d2"></div><div class="drive d1"><span></span><i></i></div>
+          <div class="spark s1">+</div><div class="spark s2">+</div><div class="spark s3">+</div>
+        </div>
+      </div>
+      <div class="section-heading"><div><h2>Start a scan</h2><p>Choose what you want to do, then select a raw disk image.</p></div></div>
+      <div class="modes" id="modes">
+        <button class="mode selected" data-mode="recover" aria-pressed="true"><span class="mode-icon">▧</span><span><strong>Recover files</strong><small>Find photos, documents, and other files with PhotoRec.</small></span><span class="radio"></span></button>
+        <button class="mode" data-mode="inspect" aria-pressed="false"><span class="mode-icon secondary">◫</span><span><strong>Inspect partitions</strong><small>View the partition layout reported by TestDisk.</small></span><span class="radio"></span></button>
+      </div>
+      <div class="source-card">
+        <input id="image-file" type="file" accept=".img,.dd,.raw,.bin,.ima" hidden>
+        <button id="dropzone" class="dropzone" type="button">
+          <span class="upload-icon" aria-hidden="true">⇧</span>
+          <span><strong id="file-title">Choose a disk image</strong><small id="file-detail">Browse or drop a raw image here (.img, .dd, .raw)</small></span>
+        </button>
+        <div class="source-footer"><button id="demo" class="quiet" type="button" disabled>Try a sample scan <span aria-hidden="true">↗</span></button><button id="start" class="primary" type="button" disabled>Start scan <span aria-hidden="true">→</span></button></div>
+      </div>
+      <p id="scan-error" class="error" role="alert"></p>
+    </section>
+    <section id="results-view" hidden>
+      <div class="section-heading result-heading"><div><p class="crumb">WORKSPACE / RESULTS</p><h1>Scan results</h1><p id="result-source">Run a scan to see results here.</p></div><button id="new-scan" class="outline">+ New scan</button></div>
+      <div class="status-panel"><span id="status-dot"></span><div><strong id="job-status" role="status">No scan yet</strong><small id="job-detail"></small></div><button id="stop" class="outline" hidden>Stop scan</button></div>
+      <p id="result-error" class="error" role="alert"></p>
+      <div id="results-panel" class="results-panel" hidden>
+        <div class="result-toolbar">
+          <input id="search" type="search" placeholder="Search recovered files" aria-label="Search recovered files">
+          <select id="type-filter" aria-label="File type"><option value="">All file types</option></select>
+          <button id="export" class="primary" disabled>Export selected</button>
+        </div>
+        <div class="browser">
+          <div class="table-scroll"><table><thead><tr><th><input id="select-all" type="checkbox" aria-label="Select all visible files"></th><th scope="col">Name</th><th scope="col">Type</th><th scope="col">Size</th></tr></thead><tbody id="file-rows"></tbody></table><p id="empty-files" hidden>No files match the current filters.</p></div>
+          <aside class="preview" id="preview"><p>Select a file name to preview it.</p></aside>
+        </div>
+        <div id="result-count" class="result-count" aria-live="polite"></div>
+      </div>
+      <details id="engine-output" hidden><summary>Engine output</summary><pre id="engine-log"></pre></details>
+    </section>
+    <footer><span class="footer-icon" aria-hidden="true">◇</span> Scans use a read-only copy of the source image. Export recovered files to a separate drive.</footer>
+  </main>
+</div>
+</body>
+</html>
