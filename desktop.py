@@ -239,6 +239,7 @@ class RecoveryWindow(tk.Tk):
         self.thumb_thread = None
         self.thumb_events = queue.SimpleQueue()
         self.scan_generation = 0
+        self.admin_warning = None
         self.back_stack = []
         self.scan_source = "Results"
         self.build()
@@ -522,32 +523,26 @@ class RecoveryWindow(tk.Tk):
         self.name_hint.set(options.name)
         self.movie_filter.set("MP4 / MOV movies" if options.movies else "All file types")
         if options.resume_scan:
-            if self.elevated:
-                self.start_scan(False)
-            else:
-                self.source_label.configure(text="Administrator access was not granted. Scan has not started.")
+            self.start_scan(False)
 
-    def elevate(self, resume_scan=False):
-        if not self.can_scan_drives or self.job is not None or self.saving:
-            return
-        script = Path(__file__).resolve()
-        executable = Path(sys.executable).with_name("pythonw.exe")
-        args = [str(script), "--mode=" + self.mode.get(), "--source=" + self.source_text.get(),
-                "--name=" + self.name_hint.get()]
-        if self.movie_filter.get() == "MP4 / MOV movies":
-            args.append("--movies")
-        if resume_scan:
-            args.append("--resume-scan")
-        arguments = subprocess.list2cmdline(args)
-        run = ctypes.windll.shell32.ShellExecuteW
-        run.argtypes = (ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_wchar_p,
-                        ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_int)
-        run.restype = ctypes.c_void_p
-        result = run(None, "runas", str(executable), arguments, str(script.parent), 1)
-        if not result or result <= 32:
-            self.source_label.configure(text="Administrator access was not granted. Scan has not started.")
-        else:
-            self.close()
+    def show_admin_warning(self):
+        if self.admin_warning is not None and self.admin_warning.winfo_exists():
+            self.admin_warning.destroy()
+        panel = self.admin_warning = tk.Frame(self, bg=SURFACE, padx=14, pady=10,
+                                               highlightbackground="#e4b75f", highlightthickness=1)
+        tk.Label(panel, text="Administrator access required", anchor="w", bg=SURFACE,
+                 fg="#ffd484", font=("Segoe UI Semibold", 11)).grid(row=0, column=0, sticky="w")
+        tk.Label(panel, text="To start this scan, right-click Digger.exe and choose Run as administrator.",
+                 wraplength=330, justify="left", bg=SURFACE, fg=TEXT).grid(row=1, column=0, sticky="w")
+        tk.Button(panel, text="Dismiss", bg=SURFACE, fg=TEXT, activebackground=SELECT, activeforeground=TEXT,
+                  relief="flat", command=panel.destroy).grid(row=0, column=1, padx=(8, 0))
+        def reveal(step):
+            panel.place(relx=1, rely=1, x=-18, y=-85 + (8-step)**2//2, anchor="se")
+            if step < 8:
+                panel.after(18, reveal, step+1)
+        reveal(0 if self.animate.get() else 8)
+        panel.lift()
+        panel.after(14000, panel.destroy)
 
     def continue_deep_scan(self):
         drive = self.deep_drive
@@ -780,7 +775,7 @@ class RecoveryWindow(tk.Tk):
             if not self.elevated:
                 text = "Administrator access is required to read the drive."
                 if self.can_scan_drives:
-                    text = "Windows will ask for administrator access when you start."
+                    text = "Start Digger as administrator to scan this drive."
             else:
                 text = "Save recovered files to a different physical disk."
             if value:
@@ -842,7 +837,7 @@ class RecoveryWindow(tk.Tk):
                     messagebox.showerror("Scan source", "Choose an existing disk image file.")
                     return
         if not sample and mode in ("live_ntfs", "formatted", "bin", "folder") and not self.elevated:
-            self.elevate(resume_scan=True)
+            self.show_admin_warning()
             return
         if sample:
             location = filedialog.askdirectory(title="Choose a healthy drive for the 48 MiB recovery test")
