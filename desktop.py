@@ -109,6 +109,24 @@ def file_icon(kind, size=20):
     return ImageTk.PhotoImage(picture.resize((size, size), Image.Resampling.LANCZOS))
 
 
+def row_images(picture):
+    icons = []
+    for checked in (False, True, None):
+        tile = Image.new("RGBA", (43, 24))
+        draw = ImageDraw.Draw(tile)
+        draw.rounded_rectangle((1, 5, 15, 19), radius=3, fill=ACCENT if checked else None,
+                               outline="#7cafff" if checked else "#939ba7")
+        if checked:
+            draw.line(((4, 12), (7, 15), (12, 9)), fill="white", width=2)
+        if checked is None:
+            draw.line((4, 12, 12, 12), fill="#94bfff", width=2)
+        icon = picture.copy()
+        icon.thumbnail((22, 22), Image.Resampling.LANCZOS)
+        tile.paste(icon, (20, (24-icon.height)//2))
+        icons.append(ImageTk.PhotoImage(tile))
+    return icons
+
+
 FILE_GROUPS = {"Pictures": IMAGE_TYPES, "Videos": VIDEO_TYPES,
                "Documents": {".pdf", ".txt", ".doc", ".docx", ".odt", ".rtf", ".xls", ".xlsx", ".csv"},
                "Audio": {".mp3", ".wav", ".flac", ".m4a", ".ogg"},
@@ -180,6 +198,14 @@ class RecoveryWindow(tk.Tk):
         kinds = (*FILE_GROUPS, "Folder", "Other files")
         self.icons = {kind: file_icon(kind) for kind in kinds}
         self.large_icons = {kind: file_icon(kind, 56) for kind in kinds}
+        self.row_icons = {kind: row_images(ImageTk.getimage(icon)) for kind, icon in self.icons.items()}
+        self.thumbnails = {}
+        self.thumb_tried = set()
+        self.thumb_thread = None
+        self.thumb_events = queue.SimpleQueue()
+        self.scan_generation = 0
+        self.back_stack = []
+        self.scan_source = "Results"
         self.build()
         if len(sys.argv) > 1:
             parser = argparse.ArgumentParser()
@@ -209,6 +235,8 @@ class RecoveryWindow(tk.Tk):
         style.configure("Digger.TButton", background=ACCENT, foreground="white", borderwidth=0, padding=(17, 9))
         style.map("Digger.TButton", background=[("disabled", SURFACE), ("active", "#396ac4")],
                   foreground=[("disabled", MUTED), ("active", "white")])
+        style.configure("Preview.TButton", background="#304e7c", foreground="white")
+        style.map("Preview.TButton", background=[("active", "#3c6199"), ("disabled", SURFACE)])
         style.configure("TEntry", fieldbackground=SURFACE, insertcolor=TEXT, padding=7)
         style.configure("TCombobox", fieldbackground=SURFACE, arrowcolor=TEXT, padding=6)
         style.map("TCombobox", fieldbackground=[("readonly", SURFACE)], foreground=[("readonly", TEXT)])
@@ -232,10 +260,9 @@ class RecoveryWindow(tk.Tk):
         mark.create_oval(3, 3, 27, 27, outline="#79abff", width=3)
         mark.create_arc(8, 8, 22, 22, start=20, extent=225, style="arc", outline="#79abff", width=2)
         mark.create_line(23, 23, 31, 31, fill="#79abff", width=4)
-        tk.Label(top, text="Digger", font=("Segoe UI Semibold", 19), bg=DARK,
+        tk.Label(top, text="Digger Data Recovery", font=("Segoe UI Semibold", 12), bg=DARK,
                  fg=TEXT, padx=10, pady=12).pack(side="left")
-        ttk.Checkbutton(top, text="Animations", variable=self.animate,
-                        command=self.update_motion).pack(side="right", padx=20)
+
         self.banner = tk.Frame(self, bg=PANEL, padx=20, pady=9)
         self.banner.pack(side="bottom", fill="x")
         self.ring = tk.Canvas(self.banner, width=56, height=56, bg=PANEL, highlightthickness=0)
@@ -249,10 +276,10 @@ class RecoveryWindow(tk.Tk):
                                      font=("Segoe UI Semibold", 17), anchor="w")
         self.status_label.pack(fill="x")
         self.source_summary = ttk.Label(self.banner, background=PANEL, foreground=TEXT)
-        self.activity = ttk.Label(self.banner, background=PANEL, foreground=MUTED)
+        self.activity = tk.Label(self, anchor="w", padx=12, pady=3, bg="#28354b", fg="#cadbf5")
         self.progress = ttk.Progressbar(self.banner, mode="indeterminate")
-        self.activity.pack(fill="x")
-        body = ttk.Frame(self, padding=(6, 6))
+        self.activity.pack(side="bottom", fill="x")
+        body = ttk.Frame(self)
         body.pack(fill="both", expand=True)
         style.layout("Workspace.TNotebook.Tab", [])
         style.layout("Workspace.TNotebook", [("Notebook.client", {"sticky": "nswe"})])
@@ -260,11 +287,17 @@ class RecoveryWindow(tk.Tk):
         self.tabs = ttk.Notebook(body, style="Workspace.TNotebook")
         self.tabs.pack(fill="both", expand=True)
         self.scan_page = ttk.Frame(self.tabs, padding=20)
-        self.results_page = ttk.Frame(self.tabs, padding=(8, 6))
+        self.results_page = ttk.Frame(self.tabs)
         self.tabs.add(self.scan_page, text="  New scan  ")
         self.tabs.add(self.results_page, text="  Scan results  ")
-        for label, page in (("Locations", self.scan_page), ("Results", self.results_page)):
-            ttk.Button(top, text=label, command=lambda p=page: self.tabs.select(p)).pack(side="left", padx=3)
+        nav = ttk.Menubutton(top, text="☰", width=3)
+        nav.pack(side="right", padx=10)
+        nav_menu = tk.Menu(nav, tearoff=False, bg=SURFACE, fg=TEXT)
+        nav_menu.add_command(label="Scan locations", command=lambda: self.tabs.select(self.scan_page))
+        nav_menu.add_command(label="Recovery results", command=lambda: self.tabs.select(self.results_page))
+        nav_menu.add_checkbutton(label="Animations", variable=self.animate, command=self.update_motion)
+        nav.configure(menu=nav_menu)
+        ttk.Button(top, text="Results", command=lambda: self.tabs.select(self.results_page)).pack(side="right")
         self.build_scan()
         self.build_results()
 
@@ -421,21 +454,19 @@ class RecoveryWindow(tk.Tk):
         self.open_output = ttk.Button(heading, text="Open recovery folder", state="disabled",
                                       command=lambda: os.startfile(self.output_folder))
 
-        tools = ttk.Frame(page)
-        tools.pack(fill="x", pady=10)
+        tools = ttk.Frame(page, padding=(10, 8))
+        tools.pack(fill="x")
         ttk.Button(tools, text="⌂", width=3, command=lambda: self.tabs.select(self.scan_page)).pack(side="left")
+        self.back_button = ttk.Button(tools, text="←", width=3, state="disabled", command=self.facet_back)
+        self.back_button.pack(side="left", padx=(8, 3))
+        self.up_button = ttk.Button(tools, text="↑", width=3, state="disabled", command=self.facet_up)
+        self.up_button.pack(side="left")
         self.breadcrumb = ttk.Label(tools, text="Results", font=("Segoe UI Semibold", 12), anchor="w")
         self.breadcrumb.pack(side="left", fill="x", expand=True, padx=10)
-        ttk.Label(tools, text="Search").pack(side="left")
-        self.search_entry = ttk.Entry(tools, textvariable=self.search, width=19)
-        self.search_entry.pack(side="left", padx=6)
+        self.search_entry = ttk.Entry(tools, textvariable=self.search, width=23)
         self.bind("<Control-f>", self.focus_search)
-        types = ttk.Combobox(tools, textvariable=self.format, values=("All file types",),
-                             state="readonly", width=12)
-        types.pack(side="left")
-        self.types = types
-        sort_button = ttk.Menubutton(tools, text="Sort & group")
-        sort_button.pack(side="left", padx=7)
+        sort_button = ttk.Menubutton(tools, text="View")
+        sort_button.pack(side="left", padx=4)
         menu = tk.Menu(sort_button, tearoff=False)
         for title, variable, options in (
             ("Sort by", self.sort, SORTS),
@@ -448,11 +479,31 @@ class RecoveryWindow(tk.Tk):
                                         command=self.render_files)
             menu.add_cascade(label=title, menu=submenu)
         sort_button.configure(menu=menu)
-        ttk.Button(tools, text="Clear filters", command=self.clear_filters).pack(side="left")
+        menu.add_separator()
+        menu.add_command(label="Select this page", command=self.select_all)
+        menu.add_command(label="Clear selection", command=self.clear_selection)
+        menu.add_command(label="Save scan report…", command=self.save_report)
+        self.filter_button = ttk.Menubutton(tools, text="Filter")
+        self.filter_button.pack(side="left", padx=4)
+        self.filter_menu = tk.Menu(self.filter_button, tearoff=False, postcommand=self.populate_filters)
+        self.filter_button.configure(menu=self.filter_menu)
+        self.search_entry.pack(side="left", padx=(8, 0))
+        search_hint = tk.Label(self.search_entry, text="Search files or folders", bg=SURFACE, fg=MUTED)
+        def hint(_event=None):
+            if self.search.get() or self.focus_get() == self.search_entry:
+                search_hint.place_forget()
+            else:
+                search_hint.place(x=7, rely=.5, anchor="w")
+        search_hint.bind("<Button-1>", self.focus_search)
+        self.search_entry.bind("<FocusIn>", hint)
+        self.search_entry.bind("<FocusOut>", hint)
+        self.search.trace_add("write", lambda *_: hint())
+        hint()
+
         self.export_button = ttk.Button(self.banner, text="Recover selected…", style="Digger.TButton",
                                         command=self.save_selected, state="disabled")
         self.export_button.pack(side="right", before=self.status_label, padx=8)
-        ttk.Button(heading, text="Clear selection", command=self.clear_selection).pack(side="right", padx=6)
+
         self.search.trace_add("write", lambda *_: self.render_files())
         self.format.trace_add("write", lambda *_: self.render_files())
 
@@ -466,7 +517,7 @@ class RecoveryWindow(tk.Tk):
         for name in ("Folder", "Type"):
             ttk.Radiobutton(facet_tabs, style="Toolbutton", text="Path" if name == "Folder" else "Type", value=name, variable=self.facet_mode,
                             command=self.refresh_facets).pack(side="left", expand=True, fill="x")
-        self.facet_list = ttk.Treeview(navigation, columns=("count",), show="tree headings",
+        self.facet_list = ttk.Treeview(navigation, columns=("count",), show="tree",
                                        selectmode="browse", height=8)
         self.facet_list.heading("#0", text="Folder")
         self.facet_list.heading("count", text="Files")
@@ -476,6 +527,7 @@ class RecoveryWindow(tk.Tk):
         self.facet_list.configure(yscrollcommand=facet_scroll.set)
         facet_scroll.pack(side="right", fill="y")
         self.facet_list.pack(fill="both", expand=True)
+        self.facet_list.bind("<Button-1>", self.check_facet)
         self.facet_list.bind("<<TreeviewSelect>>", self.select_facet)
         self.refresh_facets(render=False)
         listing = ttk.Frame(split)
@@ -486,16 +538,17 @@ class RecoveryWindow(tk.Tk):
         self.tree.column("pick", width=35, minwidth=30, stretch=False, anchor="center")
         self.tree.bind("<Button-1>", self.toggle_checked)
         self.tree.bind("<space>", self.check_focused)
-        self.tree.heading("#0", text="Name")
+        self.tree.heading("#0", text="Name", anchor="w")
+        self.tree.configure(displaycolumns=("date", "type", "size"))
         self.tree.heading("folder", text="Original folder")
         self.tree.heading("type", text="Type")
         self.tree.heading("size", text="Size")
-        self.tree.heading("date", text="File date")
+        self.tree.heading("date", text="Date modified")
         self.tree.heading("check", text="Recoverability")
-        for key, width in (("#0", 145), ("folder", 150), ("type", 62), ("size", 72), ("date", 100), ("check", 153)):
+        for key, width in (("#0", 265), ("folder", 150), ("type", 90), ("size", 85), ("date", 120), ("check", 153)):
             self.tree.column(key, width=width, minwidth=45)
         for label, (_, color) in CHECKS.items():
-            self.tree.tag_configure(label, foreground=color)
+            self.tree.tag_configure(label, foreground=TEXT)
         self.tree.tag_configure("alternate", background="#292e37")
         self.tree.tag_configure("group", background=SURFACE, foreground=TEXT)
         for key, field in (("#0", "Name"), ("type", "Type"), ("size", "Size"),
@@ -517,22 +570,27 @@ class RecoveryWindow(tk.Tk):
         self.tree.configure(xscrollcommand=xbar.set)
         xbar.pack(side="bottom", fill="x")
         selection_bar = ttk.Frame(listing)
-        selection_bar.pack(fill="x", pady=(6, 0))
+        selection_bar.pack(side="bottom", fill="x")
         self.next_page = ttk.Button(selection_bar, text="Next ›", command=lambda: self.change_page(1))
         self.prev_page = ttk.Button(selection_bar, text="‹ Previous", command=lambda: self.change_page(-1))
         self.next_page.pack(side="right")
         self.prev_page.pack(side="right", padx=4)
         self.footer = ttk.Label(selection_bar, text="0 files", foreground=MUTED)
         self.footer.pack(side="left")
-        ttk.Button(selection_bar, text="Select page", command=self.select_all).pack(side="right", padx=4)
-        self.report_button = ttk.Button(selection_bar, text="Save report…", command=self.save_report, state="disabled")
-        self.report_button.pack(side="right", padx=4)
+
+
+
 
         self.tree.pack(fill="both", expand=True)
 
         inspector = ttk.Frame(split, padding=(12, 0, 0, 0))
         split.add(inspector, weight=2)
-        ttk.Label(inspector, text="File preview", font=("Segoe UI Semibold", 14)).pack(anchor="w", pady=(0, 10))
+        def initial_panes(event):
+            if event.width > 600:
+                split.sashpos(0, int(event.width * .23))
+                split.sashpos(1, int(event.width * .83))
+                split.unbind("<Configure>", binding)
+        binding = split.bind("<Configure>", initial_panes)
         self.preview_symbol = ttk.Label(inspector)
         self.details = ttk.Label(inspector, foreground=MUTED, wraplength=245, justify="left")
 
@@ -540,8 +598,8 @@ class RecoveryWindow(tk.Tk):
         self.preview.pack(anchor="w", pady=(4, 8))
         actions = ttk.Frame(inspector)
         actions.pack(fill="x", pady=(0, 6))
-        self.open_button = ttk.Button(actions, text="Open", state="disabled", command=self.open_file)
-        self.open_button.pack(side="right")
+        self.open_button = ttk.Button(actions, text="Preview", style="Preview.TButton", state="disabled", command=self.preview_clicked)
+        self.open_button.pack(fill="x")
         self.zoom_controls = ttk.Frame(actions)
         self.zoom_label = ttk.Label(self.zoom_controls, text="100%", width=6)
         self.zoom_label.pack(side="left")
@@ -553,13 +611,8 @@ class RecoveryWindow(tk.Tk):
         self.preview_actions = actions
         canvas_frame.columnconfigure(0, weight=1)
         canvas_frame.rowconfigure(0, weight=1)
-        self.canvas = tk.Canvas(canvas_frame, height=180, width=190, bg=PANEL, highlightthickness=0)
+        self.canvas = tk.Canvas(canvas_frame, height=118, width=190, bg=PANEL, highlightthickness=0)
         self.canvas.grid(row=0, column=0, sticky="nsew")
-        for axis, row, column, edge in (("x", 1, 0, "ew"), ("y", 0, 1, "ns")):
-            scroll = ttk.Scrollbar(canvas_frame, orient="horizontal" if axis == "x" else "vertical",
-                                   command=getattr(self.canvas, axis + "view"))
-            self.canvas.configure({axis + "scrollcommand": scroll.set})
-            scroll.grid(row=row, column=column, sticky=edge)
         self.canvas.bind("<Configure>", lambda _: self.draw_preview())
         self.canvas.bind("<MouseWheel>", self.wheel_zoom)
         self.canvas.bind("<ButtonPress-1>", lambda event: self.canvas.scan_mark(event.x, event.y))
@@ -704,20 +757,24 @@ class RecoveryWindow(tk.Tk):
                     "self_test": sample, "started": monotonic(), "source": str(source or ("Recycle Bin" if mode == "bin" else "Built-in NTFS test image"))}
         if mode == "formatted":
             self.job.update(device=device, movies_only=self.movie_filter.get() == "MP4 / MOV movies")
-        self.breadcrumb.configure(text=self.job["source"])
+        self.scan_source = self.job["source"]
+        self.thumbnails.clear()
+        self.thumb_tried.clear()
+        self.scan_generation += 1
+        self.breadcrumb.configure(text=self.scan_source)
         self.ring.itemconfigure(self.ring_text, text="…")
         self.ring.itemconfigure(self.ring_arc, extent=0, outline=ACCENT)
         self.source_summary.configure(text=self.job["source"])
-        self.source_summary.pack(before=self.activity, fill="x")
+        self.source_summary.pack(fill="x")
         self.save_status.configure(text="")
         self.activity.configure(text="Opening the scan source…")
         self.stop_button.pack(before=self.status_label, side="right", padx=(10, 0))
         self.stop_button.configure(text="Cancel scan", state="normal")
         self.preview_key = object()
         self.page_number = 0
-        self.types.configure(values=("All file types",))
+        self.filter_button.configure(text="Filter")
         indexed = mode in ("live_ntfs", "ntfs_image", "bin", "folder")
-        self.tree.configure(displaycolumns=(("pick", "folder", "type", "size", "date", "check") if indexed else ("pick", "type", "size", "date", "check")))
+
         self.facet_mode.set("Folder" if indexed else "Type")
         self.checked.clear()
         self.extensions.clear()
@@ -913,6 +970,7 @@ class RecoveryWindow(tk.Tk):
                 completed, self.completed_job = self.completed_job, None
                 self.finish_scan(completed)
         self.refresh_preview()
+        self.refresh_thumbnails()
         self.refresh_save()
         self.after(100, self.refresh)
 
@@ -923,7 +981,6 @@ class RecoveryWindow(tk.Tk):
     def add_matches(self, matches):
         added = []
         counts = Counter()
-        previous_extensions = len(self.extensions)
         for path, original in matches:
             key = str(len(self.files))
             try:
@@ -949,8 +1006,7 @@ class RecoveryWindow(tk.Tk):
             self.facet_counts[value] += count
             self.update_facet(value)
         self.facet_list.set("all", "count", len(self.files))
-        if len(self.extensions) != previous_extensions:
-            self.types.configure(values=("All file types", *sorted(self.extensions)))
+
         if self.sort.get() == "Discovery order" and self.direction.get() == "Ascending" and self.group.get() == "None":
             start = self.page_number * self.page_size
             for key in added:
@@ -959,7 +1015,7 @@ class RecoveryWindow(tk.Tk):
                         self.insert_result(key, "")
                         self.shown_count += 1
                     self.match_count += 1
-            self.report_button.configure(state="normal" if self.files else "disabled")
+
             self.next_page.configure(state="normal" if start + self.shown_count < self.match_count else "disabled")
             self.show_preview()
         elif added:
@@ -1015,6 +1071,12 @@ class RecoveryWindow(tk.Tk):
             clean = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b[()][A-Za-z0-9]|\x1b[=>]|[\x00-\x08\x0b-\x1f]", "", text)
             if job["mode"] == "inspect" or job["status"] == "failed":
                 self.set_log(clean.strip())
+
+        if job["mode"] == "ntfs_image" and job["status"] == "complete":
+            groups = Counter((entry.offset, entry.filesystem) for entry in self.files.values()
+                             if isinstance(entry, Candidate) and entry.offset > 0)
+            if groups:
+                self.partition_notice(groups)
 
     def set_log(self, content):
         self.log.configure(state="normal")
@@ -1078,30 +1140,95 @@ class RecoveryWindow(tk.Tk):
             self.facet_rows[value] = row
             parent = self.facet_rows.get(value[:-1], "")
             self.facet_list.insert(parent, "end", iid=row, text=value[-1], open=len(value) == 1,
-                                   image=self.icons["Folder" if self.facet_mode.get() == "Folder" else value[0]])
+                                   values=(self.facet_counts[value],))
+        kind = "Folder" if self.facet_mode.get() == "Folder" or len(value) > 1 else value[0]
+        count = self.facet_checked[value]
+        state = 0 if not count else 1 if count == self.facet_counts[value] else 2
+        self.facet_list.item(self.facet_rows[value], image=self.row_icons[kind][state])
         self.facet_list.set(self.facet_rows[value], "count", self.facet_counts[value])
+
+    def update_checked_counts(self, keys, delta):
+        changes = Counter(part for key in keys for part in self.facet_path(key))
+        for part, count in changes.items():
+            self.facet_checked[part] += delta * count
+            self.update_facet(part)
+
+    def check_facet(self, event):
+        tree = self.facet_list
+        row = tree.identify_row(event.y)
+        if "image" not in tree.identify_element(event.x, event.y) or row not in self.facets:
+            return
+        value = self.facets[row]
+        if value is None:
+            return
+        adding = self.facet_checked[value] < self.facet_counts[value]
+        changed = [key for key in self.files if (key in self.checked) != adding and value in self.facet_path(key)]
+        if adding:
+            self.checked.update(changed)
+        else:
+            self.checked.difference_update(changed)
+            self.tree.selection_remove(*self.tree.selection())
+        self.update_checked_counts(changed, 1 if adding else -1)
+        for key in changed:
+            if self.tree.exists(key):
+                self.tree.item(key, image=self.result_icon(key))
+        self.show_preview()
+        return "break"
 
     def refresh_facets(self, render=True):
         self.facet_list.delete(*self.facet_list.get_children())
+        self.back_stack.clear()
         self.facets = {"all": None}
         self.facet_filter = None
         self.facet_list.heading("#0", text=self.facet_mode.get())
         self.facet_list.insert("", "end", iid="all", text="All files", values=(len(self.files),))
         self.facet_counts = Counter(part for key in self.files for part in self.facet_path(key))
+        self.facet_checked = Counter(part for key in self.checked for part in self.facet_path(key))
         self.facet_rows.clear()
         for value in sorted(self.facet_counts):
             self.update_facet(value)
         self.facet_list.selection_set("all")
+        self.update_breadcrumb()
         if render:
             self.render_files()
+
+    def populate_filters(self):
+        self.filter_menu.delete(0, "end")
+        for extension in ("All file types", *sorted(self.extensions)):
+            self.filter_menu.add_radiobutton(label=extension, variable=self.format, value=extension)
+        self.filter_menu.add_separator()
+        self.filter_menu.add_command(label="Clear filters", command=self.clear_filters)
+
+    def update_breadcrumb(self):
+        parts = self.facet_filter or ()
+        self.breadcrumb.configure(text="   ›   ".join([self.scan_source, *parts]))
+        self.up_button.configure(state="normal" if parts else "disabled")
+        self.back_button.configure(state="normal" if self.back_stack else "disabled")
+
+    def goto_facet(self, value):
+        self.facet_filter = value
+        row = self.facet_rows.get(value, "all")
+        self.facet_list.selection_set(row)
+        self.facet_list.see(row)
+        self.page_number = 0
+        self.update_breadcrumb()
+        self.render_files()
+
+    def facet_back(self):
+        if self.back_stack:
+            self.goto_facet(self.back_stack.pop())
+
+    def facet_up(self):
+        if self.facet_filter:
+            self.back_stack.append(self.facet_filter)
+            self.goto_facet(self.facet_filter[:-1] or None)
 
     def select_facet(self, _event=None):
         selection = self.facet_list.selection()
         value = self.facets.get(selection[0]) if selection else None
         if value != self.facet_filter:
-            self.facet_filter = value
-            self.page_number = 0
-            self.render_files()
+            self.back_stack.append(self.facet_filter)
+            self.goto_facet(value)
 
     def clear_filters(self):
         self.facet_filter = None
@@ -1148,11 +1275,63 @@ class RecoveryWindow(tk.Tk):
                 and self.extension in ("All file types", path.suffix.upper())
                 and (self.facet_filter is None or self.facet_filter in self.facet_path(key)))
 
+    def refresh_thumbnails(self):
+        try:
+            generation, results = self.thumb_events.get_nowait()
+        except queue.Empty:
+            pass
+        else:
+            self.thumb_thread = None
+            if generation == self.scan_generation:
+                for key, picture in results:
+                    if self.tree.exists(key):
+                        self.remember_thumbnail(key, picture)
+        if self.thumb_thread or not self.tree.winfo_ismapped():
+            return
+        visible = {self.tree.identify_row(y) for y in range(0, self.tree.winfo_height(), 12)}
+        work = []
+        for key in visible:
+            if key not in self.files or key in self.thumbnails or key in self.thumb_tried:
+                continue
+            path = self.materialized.get(key, self.files[key])
+            if isinstance(path, Candidate) or self.display_path(key).suffix.lower() not in IMAGE_TYPES:
+                continue
+            work.append((key, path))
+            self.thumb_tried.add(key)
+        if work:
+            def read(generation):
+                results = []
+                for key, path in work:
+                    try:
+                        with Image.open(path) as img:
+                            img.thumbnail((22, 22))
+                            results.append((key, img.convert("RGBA")))
+                    except (OSError, ValueError, Image.DecompressionBombError):
+                        continue
+                self.thumb_events.put((generation, results))
+            self.thumb_thread = threading.Thread(target=read, args=(self.scan_generation,), daemon=True)
+            self.thumb_thread.start()
+
+    def remember_thumbnail(self, key, picture):
+        if key not in self.thumbnails and len(self.thumbnails) >= self.page_size:
+            oldest = next(iter(self.thumbnails))
+            self.thumbnails.pop(oldest)
+            self.thumb_tried.discard(oldest)
+            if self.tree.exists(oldest):
+                self.tree.item(oldest, image=self.result_icon(oldest))
+        self.thumbnails[key] = row_images(picture)
+        if self.tree.exists(key):
+            self.tree.item(key, image=self.result_icon(key))
+
+    def result_icon(self, key):
+        kind = GROUP_BY_SUFFIX.get(self.display_path(key).suffix.lower(), "Other files")
+        return self.thumbnails.get(key, self.row_icons[kind])[key in self.checked]
+
     def insert_result(self, key, parent):
         path = self.display_path(key)
         check = self.check_label(key)
         self.tree.insert(parent, "end", iid=key, text=path.name,
-                         image=self.icons[GROUP_BY_SUFFIX.get(path.suffix.lower(), "Other files")],
+                         image=self.result_icon(key),
                          values=("☑" if key in self.checked else "☐", str(path.parent) if key in self.originals else "",
                                  path.suffix.lstrip(".").upper(), size_label(self.metadata[key].st_size),
                                  self.file_date(key), check), tags=(check, "alternate") if int(key) % 2 else (check,))
@@ -1168,6 +1347,7 @@ class RecoveryWindow(tk.Tk):
         self.tree.delete(*self.tree.get_children())
         self.query = self.search.get().casefold()
         self.extension = self.format.get()
+        self.filter_button.configure(text="Filter" if self.extension == "All file types" else self.extension)
         keys = [key for key in self.files if self.matches_filter(key)]
         sort_key = {
             "Discovery order": int,
@@ -1195,7 +1375,7 @@ class RecoveryWindow(tk.Tk):
                                                  tags=("group",), open=True)
             self.insert_result(key, groups.get(label, ""))
         self.shown_count = len(keys)
-        self.report_button.configure(state="normal" if self.files else "disabled")
+
         self.tree.selection_set([key for key in keys if key in selected])
         if scroll:
             self.tree.yview_moveto(scroll[0])
@@ -1208,7 +1388,7 @@ class RecoveryWindow(tk.Tk):
         return "break"
 
     def toggle_checked(self, event):
-        if self.tree.identify_region(event.x, event.y) != "cell" or self.tree.identify_column(event.x) != "#1":
+        if self.tree.identify_column(event.x) != "#0" or "image" not in self.tree.identify_element(event.x, event.y):
             return
         key = self.tree.identify_row(event.y)
         if key in self.files:
@@ -1218,10 +1398,12 @@ class RecoveryWindow(tk.Tk):
             return "break"
 
     def clear_selection(self):
-        for key in self.checked:
-            if self.tree.exists(key):
-                self.tree.set(key, "pick", "☐")
+        previous = list(self.checked)
         self.checked.clear()
+        for key in previous:
+            if self.tree.exists(key):
+                self.tree.item(key, image=self.result_icon(key))
+        self.update_checked_counts(previous, -1)
         self.tree.selection_remove(*self.tree.selection())
         self.show_preview()
 
@@ -1232,7 +1414,8 @@ class RecoveryWindow(tk.Tk):
                 self.tree.selection_remove(*self.tree.selection())
         else:
             self.checked.add(key)
-        self.tree.set(key, "pick", "☑" if key in self.checked else "☐")
+        self.update_checked_counts([key], 1 if key in self.checked else -1)
+        self.tree.item(key, image=self.result_icon(key))
         self.show_preview()
 
     def recovery_selection(self):
@@ -1269,7 +1452,7 @@ class RecoveryWindow(tk.Tk):
         self.details.pack(anchor="w", fill="x", pady=(10, 6))
         folder = str(display.parent) if key in self.originals else "Original folder unknown"
         self.details.configure(text=f"Name\n{display.name}\n\nSize\n{size_label(self.metadata[key].st_size)}"
-                                    f"\n\nType\n{display.suffix.upper().lstrip('.')}\n\nLocation\n{folder}")
+                                    f"\n\nType\n{display.suffix.upper().lstrip('.')} file\n\nPath\n{folder}\n\nRecovery evidence\n{self.check_label(key)}")
         suffix = display.suffix.lower()
         media = suffix in IMAGE_TYPES or suffix in VIDEO_TYPES
         live_preview = False
@@ -1282,9 +1465,9 @@ class RecoveryWindow(tk.Tk):
                 self.open_button.configure(state="disabled")
                 self.preview.configure(text=f"{display.name} · Recover this file to preview it.")
                 return
-        self.open_button.configure(text="Play" if suffix in VIDEO_TYPES else "Open",
+        self.open_button.configure(text="Play" if suffix in VIDEO_TYPES else "Preview",
                                    state="normal" if media and not live_preview else "disabled")
-        self.preview.configure(text=f"{display.name} · Loading preview…" if media
+        self.preview.configure(text="Loading preview…" if media
                                else f"{display.name} · Preview unavailable")
         if media:
             self.preview_pending = key, path, suffix
@@ -1333,11 +1516,14 @@ class RecoveryWindow(tk.Tk):
                 shown = self.check_label(key)
                 self.tree.set(key, "check", shown)
                 self.tree.item(key, tags=(shown,))
+            if bitmap is not None:
+                self.remember_thumbnail(key, bitmap)
             if self.preview_key == key:
                 self.preview_bitmap = bitmap
                 if bitmap is not None:
                     self.preview_symbol.pack_forget()
-                self.preview.configure(text=f"{self.display_path(key).name} · {check}")
+                    self.open_button.configure(state="normal")
+                self.preview.configure(text="" if bitmap is not None else check)
                 self.zoom_slider.configure(state="normal" if bitmap is not None else "disabled")
                 self.draw_preview()
         self.start_preview()
@@ -1350,8 +1536,8 @@ class RecoveryWindow(tk.Tk):
             self.zoom_controls.pack_forget()
             return
         if not self.canvas_frame.winfo_manager():
-            self.canvas_frame.pack(after=self.preview_actions, fill="both", expand=True)
-            self.zoom_controls.pack(side="left", expand=True, fill="x")
+            self.canvas_frame.pack(before=self.preview, fill="x", pady=(8, 5))
+            self.zoom_controls.pack(fill="x", pady=(4, 0))
         zoom = self.zoom.get()
         self.zoom_label.configure(text=f"{zoom:.0%}")
         width = self.canvas.winfo_width()
@@ -1375,6 +1561,23 @@ class RecoveryWindow(tk.Tk):
     def open_clicked(self, event):
         if self.tree.identify_row(event.y) in self.files:
             self.open_file()
+
+    def preview_clicked(self):
+        if self.preview_bitmap is None or self.preview_key is None:
+            return self.open_file()
+        path = self.display_path(self.preview_key)
+        if path.suffix.lower() in VIDEO_TYPES:
+            return self.open_file()
+        viewer = tk.Toplevel(self)
+        viewer.title(path.name)
+        viewer.transient(self)
+        picture = self.preview_bitmap.copy()
+        picture.thumbnail((int(self.winfo_screenwidth()*.85), int(self.winfo_screenheight()*.8)))
+        image = ImageTk.PhotoImage(picture)
+        label = tk.Label(viewer, image=image, bg=PANEL)
+        label.image = image
+        label.pack(fill="both", expand=True)
+        viewer.bind("<Escape>", lambda _: viewer.destroy())
 
     def open_file(self, _event=None):
         selected = self.selected_files()
@@ -1414,9 +1617,10 @@ class RecoveryWindow(tk.Tk):
                     yield from file_rows(key)
 
         keys = list(file_rows())
+        self.update_checked_counts(set(keys) - self.checked, 1)
         self.checked.update(keys)
         for key in keys:
-            self.tree.set(key, "pick", "☑")
+            self.tree.item(key, image=self.result_icon(key))
         self.tree.selection_set(keys)
         self.show_preview()
         return "break"
@@ -1451,59 +1655,107 @@ class RecoveryWindow(tk.Tk):
         except OSError as exc:
             messagebox.showerror("Save scan report", str(exc))
 
+    def modal(self, title, width, height):
+        # The shade covers only Digger's client area.
+        shade = tk.Toplevel(self)
+        shade.withdraw()
+        shade.overrideredirect(True)
+        shade.transient(self)
+        shade.configure(bg="black")
+        shade.attributes("-alpha", .48)
+        shade.geometry(f"{self.winfo_width()}x{self.winfo_height()}+{self.winfo_rootx()}+{self.winfo_rooty()}")
+        shade.deiconify()
+        dialog = tk.Toplevel(shade)
+        dialog.withdraw()
+        dialog.title(title)
+        dialog.transient(shade)
+        dialog.overrideredirect(True)
+        dialog.configure(bg="#353940", highlightbackground="#4a505b", highlightthickness=1)
+        x = self.winfo_rootx() + max(0, (self.winfo_width()-width)//2)
+        y = self.winfo_rooty() + max(0, (self.winfo_height()-height)//2)
+        dialog.geometry(f"{width}x{height}+{x}+{y}")
+        dialog.deiconify()
+        dialog.lift()
+        dialog.grab_set()
+        dialog.focus_set()
+        dialog.bind("<Escape>", lambda _: shade.destroy())
+        dialog.protocol("WM_DELETE_WINDOW", shade.destroy)
+        tk.Button(dialog, text="×", command=shade.destroy, relief="flat", borderwidth=0,
+                  bg="#353940", fg=TEXT, font=("Segoe UI", 15)).place(relx=1, x=-10, y=6, anchor="ne")
+        return shade, dialog
+
+    def partition_notice(self, groups):
+        shade, dialog = self.modal("Partitions found", 452, 300)
+        tk.Label(dialog, text="Partitions with deleted files found", bg="#353940", fg=TEXT,
+                 font=("Segoe UI Semibold", 13)).pack(pady=(30, 6))
+        tk.Label(dialog, text="Choose a folder in the Path view to explore the recovered names.",
+                 bg="#353940", fg=MUTED).pack()
+        tree = ttk.Treeview(dialog, show="tree", height=3)
+        tree.pack(fill="both", expand=True, padx=48, pady=16)
+        for (sector, fs), count in sorted(groups.items()):
+            node = tree.insert("", "end", text=f"{fs.upper()} partition at sector {sector:,}",
+                               image=self.icons["Folder"], open=True)
+            tree.insert(node, "end", text=f"{count:,} deleted files")
+        ttk.Button(dialog, text="Got it", style="Digger.TButton", command=shade.destroy).pack(pady=(0, 16))
+        self.wait_window(shade)
+
     def choose_recovery_folder(self, subtitle):
-        dialog = tk.Toplevel(self)
-        dialog.title("Recovery destination")
-        dialog.configure(background=BG)
-        dialog.transient(self)
-        dialog.resizable(False, False)
-        card = ttk.Frame(dialog, padding=22)
-        card.pack(fill="both", expand=True)
-        ttk.Label(card, text="Choose where to save recovered files",
-                  font=("Segoe UI Semibold", 16)).pack(anchor="w")
-        ttk.Label(card, text=subtitle, foreground=MUTED).pack(anchor="w", pady=(4, 14))
+        self.update_idletasks()
+        shade, dialog = self.modal("Recovery destination", 562, min(576, self.winfo_height()-30))
+        color = "#353940"
+        icon = tk.Canvas(dialog, width=60, height=60, bg=color, highlightthickness=0)
+        icon.pack(pady=(28, 6))
+        icon.create_polygon(9, 4, 42, 4, 53, 15, 53, 56, 9, 56, fill="#75bafa")
+        icon.create_rectangle(19, 5, 38, 20, fill="#bde6ff", outline="")
+        icon.create_rectangle(16, 33, 46, 54, fill="#347bd2", outline="")
+        for y in (40, 44):
+            icon.create_line(21, y, 41, y, fill="#a9d9ff", width=2)
+        tk.Label(dialog, text="Choose a destination to save the files", bg=color, fg=TEXT,
+                 font=("Segoe UI Semibold", 13)).pack()
+        tk.Label(dialog, text=subtitle, bg=color, fg=MUTED).pack(pady=(4, 12))
+        footer = tk.Frame(dialog, bg=color)
+        footer.pack(side="bottom", fill="x", padx=24, pady=14)
+        panel = tk.Frame(dialog, bg="#282c32", padx=8, pady=8)
+        panel.pack(fill="both", expand=True, padx=24)
+        tk.Label(panel, text="Local", bg="#424750", fg=TEXT, pady=5).pack(fill="x", pady=(0, 6))
         choice = tk.StringVar(dialog)
-        drives = ttk.Treeview(card, columns=("drive", "free"), show="headings", height=4, selectmode="browse")
-        drives.heading("drive", text="Local drives")
-        drives.heading("free", text="Available space")
-        drives.column("drive", width=270)
-        drives.column("free", width=130, anchor="e")
-        drives.pack(fill="x")
-        for row, (root, filesystem) in self.drive_roots.items():
+        drives = ttk.Treeview(panel, columns=("space",), show="tree", height=3, selectmode="browse")
+        drives.column("#0", width=270)
+        drives.column("space", width=140, anchor="e")
+        drives.pack(fill="both", expand=True)
+        for row, (root, _) in self.drive_roots.items():
             try:
-                space = size_label(shutil.disk_usage(root).free)
+                space = shutil.disk_usage(root)
             except OSError:
                 continue
             label = self.drive_list.set(row, "volume")
-            drives.insert("", "end", iid=row, values=(f"{label} ({root})", space))
+            drives.insert("", "end", iid=row, text=f"{label} ({root})", image=self.icons["Folder"],
+                          values=(f"{size_label(space.free)} free",))
         def select_drive(_event):
             selection = drives.selection()
             if selection:
                 choice.set(self.drive_roots[selection[0]][0])
         drives.bind("<<TreeviewSelect>>", select_drive)
-        field = ttk.Frame(card)
-        field.pack(fill="x", pady=12)
-        ttk.Entry(field, textvariable=choice).pack(side="left", fill="x", expand=True)
+        field = tk.Frame(panel, bg="#282c32")
+        field.pack(fill="x", pady=(6, 0))
         def browse():
             folder = filedialog.askdirectory(parent=dialog, title="Choose recovery folder")
             if folder:
+                drives.selection_remove(*drives.selection())
                 choice.set(folder)
-        ttk.Button(field, text="Choose folder…", command=browse).pack(side="right", padx=(6, 0))
+        ttk.Button(field, text="Choose folder…", command=browse).pack(side="left", padx=(0, 6))
+        ttk.Entry(field, textvariable=choice).pack(side="left", fill="x", expand=True)
         result = []
         def accept():
-            if not Path(choice.get()).is_absolute() or not Path(choice.get()).is_dir():
+            path = Path(choice.get())
+            if not path.is_absolute() or not path.is_dir():
                 messagebox.showerror("Recovery destination", "Choose an existing folder.", parent=dialog)
                 return
             result.append(choice.get())
-            dialog.destroy()
-        ttk.Button(card, text="Save here", style="Digger.TButton", command=accept).pack(side="right")
-        ttk.Button(card, text="Cancel", command=dialog.destroy).pack(side="right", padx=6)
-        dialog.bind("<Escape>", lambda _: dialog.destroy())
-        dialog.update_idletasks()
-        dialog.geometry(f"+{self.winfo_rootx() + max(0, (self.winfo_width()-dialog.winfo_width())//2)}"
-                        f"+{self.winfo_rooty() + max(0, (self.winfo_height()-dialog.winfo_height())//2)}")
-        dialog.grab_set()
-        self.wait_window(dialog)
+            shade.destroy()
+        ttk.Button(footer, text="Save", width=12, style="Digger.TButton", command=accept).pack(side="right")
+        dialog.bind("<Return>", lambda _: accept())
+        self.wait_window(shade)
         return result[0] if result else ""
 
     def save_selected(self):
@@ -1512,7 +1764,7 @@ class RecoveryWindow(tk.Tk):
         selection = self.recovery_selection()
         if not selection:
             return
-        folder = self.choose_recovery_folder(f"{len(selection):,} selected files  ·  {size_label(sum(self.metadata[k].st_size for k in selection))}")
+        folder = self.choose_recovery_folder(f"{len(selection):,} selected file{'s' if len(selection) != 1 else ''}  ·  {size_label(sum(self.metadata[k].st_size for k in selection))}")
         if not folder:
             return
         try:
