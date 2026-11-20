@@ -211,6 +211,12 @@ class RecoveryWindow(tk.Tk):
         self.save_events = queue.SimpleQueue()
         self.files = {}
         self.originals = {}
+        self.gallery = None
+        self.bin_view = False
+        self.deleted_dates = {}
+        self.deleted_years = set()
+        self.year_filter = tk.StringVar(value="All dates")
+        self.bin_filter = tk.StringVar(value="All bin items")
         self.materialized = {}
         self.metadata = {}
         self.checks = {}
@@ -542,6 +548,11 @@ class RecoveryWindow(tk.Tk):
         panel.lift()
         panel.after(14000, panel.destroy)
 
+    def choose_media_drive(self):
+        self.pick_mode("formatted")
+        self.tabs.select(self.scan_page)
+        self.source_label.configure(text="Choose the original drive. A sector scan can find media even when its name, date and bin record are gone.")
+
     def continue_deep_scan(self):
         drive = self.deep_drive
         self.mode.set("formatted")
@@ -556,6 +567,7 @@ class RecoveryWindow(tk.Tk):
         heading.pack(side="bottom", fill="x")
         self.save_status = ttk.Label(heading, foreground=TEXT)
         self.save_status.pack(side="left")
+        self.media_drive_button = ttk.Button(heading, text="Search a drive for missing media…", command=self.choose_media_drive)
         self.deep_button = ttk.Button(heading, text="Deep scan this drive…", command=self.continue_deep_scan)
         self.open_output = ttk.Button(heading, text="Open recovery folder", state="disabled",
                                       command=lambda: os.startfile(self.output_folder))
@@ -571,6 +583,7 @@ class RecoveryWindow(tk.Tk):
         self.breadcrumb.pack(side="left", fill="x", expand=True, padx=10)
         self.search_entry = ttk.Entry(tools, textvariable=self.search, width=23)
         self.bind("<Control-f>", self.focus_search)
+        ttk.Button(tools, text="Media gallery", command=self.open_gallery).pack(side="left", padx=4)
         sort_button = ttk.Menubutton(tools, text="View")
         sort_button.pack(side="left", padx=4)
         menu = tk.Menu(sort_button, tearoff=False)
@@ -870,6 +883,7 @@ class RecoveryWindow(tk.Tk):
         else:
             folder = Path(tempfile.mkdtemp(dir=RUNS.name))
         self.deep_button.pack_forget()
+        self.media_drive_button.pack_forget()
         self.raw_source = device if mode == "formatted" else None
         self.output_folder = folder if mode == "formatted" else None
         if self.output_folder:
@@ -903,6 +917,12 @@ class RecoveryWindow(tk.Tk):
         self.checked.clear()
         self.extensions.clear()
         self.files.clear()
+        self.bin_view = mode in ("bin", "folder")
+        self.tree.heading("date", text="Date deleted" if self.bin_view else "Date modified")
+        self.deleted_dates.clear()
+        self.deleted_years.clear()
+        if self.gallery is not None and self.gallery.winfo_exists():
+            self.gallery.destroy()
         self.originals.clear()
         self.materialized.clear()
         self.metadata.clear()
@@ -998,10 +1018,10 @@ class RecoveryWindow(tk.Tk):
                     job["matches"].append((path, None))
 
     def scan_bin(self, job, folder):
-        for source, original in scan_recycle_bin(folder, cancelled=lambda: job["status"] == "stopping"):
+        for match in scan_recycle_bin(folder, cancelled=lambda: job["status"] == "stopping"):
             if job["status"] == "stopping":
                 return
-            job["matches"].append((source, original))
+            job["matches"].append(match)
         if job.get("limited"):
             return
         volumes = {root.casefold() for root, _, fs in local_volumes() if fs.upper() == "NTFS"}
@@ -1016,8 +1036,8 @@ class RecoveryWindow(tk.Tk):
             job.pop("records", None)
             job["phase"] = f"Searching {scope.drive} for emptied-bin records"
             try:
-                for payload, original in emptied_items(scope, job, folder):
-                    job["matches"].append((payload, original))
+                for match in emptied_items(scope, job, folder):
+                    job["matches"].append(match)
                 searched += 1
             except OSError as exc:
                 failures.append(f"{scope.drive} {exc}")
@@ -1107,12 +1127,15 @@ class RecoveryWindow(tk.Tk):
     def add_matches(self, matches):
         added = []
         counts = Counter()
-        for path, original in matches:
+        for path, original, *bin_date in matches:
             key = str(len(self.files))
             try:
                 info = path if isinstance(path, Candidate) else path.stat()
             except OSError:
                 continue
+            if bin_date and bin_date[0] is not None:
+                self.deleted_dates[key] = bin_date[0]
+                self.deleted_years.add(str(bin_date[0].year))
             self.files[key] = path
             self.metadata[key] = info
             if original is not None:
@@ -1159,6 +1182,8 @@ class RecoveryWindow(tk.Tk):
         self.stop_button.pack_forget()
         self.stop_button.configure(state="disabled")
         self.job = None
+        if job["mode"] in ("bin", "folder"):
+            self.media_drive_button.pack(side="right", padx=4)
         if job["mode"] == "live_ntfs":
             self.deep_drive = PureWindowsPath(job["source"]).anchor
             self.deep_button.pack(side="right", padx=4)
@@ -1172,6 +1197,9 @@ class RecoveryWindow(tk.Tk):
         elapsed = elapsed_label(job["started"])
         detail = f"   ·   {job['records'][0]:,} records examined" if job.get("records") else ""
         summary = f"{len(self.files):,} files found{detail}   ·   {elapsed}"
+        if is_bin:
+            emptied = sum(isinstance(item, Candidate) for item in self.files.values())
+            summary = f"{emptied:,} emptied-bin records · {len(self.files)-emptied:,} still in bin{detail} · {elapsed}"
         if job["status"] == "stopped":
             summary += "   ·   Scanning has stopped. Partial results are available."
         elif job.get("warnings") and not job.get("error"):
@@ -1241,6 +1269,12 @@ class RecoveryWindow(tk.Tk):
         return self.recovery_checks.get(key, self.checks.get(key, "Unchecked"))
 
     def file_date(self, key):
+        if self.bin_view:
+            deleted = self.deleted_dates.get(key)
+            return deleted.date().isoformat() if deleted else "Unknown"
+        return self.modified_date(key)
+
+    def modified_date(self, key):
         stamp = self.metadata[key].st_mtime
         try:
             return datetime.fromtimestamp(stamp).strftime("%Y-%m-%d") if stamp else "Unknown"
@@ -1325,7 +1359,17 @@ class RecoveryWindow(tk.Tk):
 
     def populate_filters(self):
         self.filter_menu.delete(0, "end")
-        for extension in ("All file types", *sorted(self.extensions)):
+        if self.bin_view:
+            for label, variable, choices in (
+                ("Date deleted", self.year_filter, ("All dates", *sorted(self.deleted_years, reverse=True), "Unknown date")),
+                ("Bin status", self.bin_filter, ("All bin items", "Emptied only", "Still in bin")),
+            ):
+                submenu = tk.Menu(self.filter_menu, tearoff=False)
+                self.filter_menu.add_cascade(label=label, menu=submenu)
+                for choice in choices:
+                    submenu.add_radiobutton(label=choice, variable=variable, value=choice, command=self.render_files)
+            self.filter_menu.add_separator()
+        for extension in ("All file types", "Photos and videos", *sorted(self.extensions)):
             self.filter_menu.add_radiobutton(label=extension, variable=self.format, value=extension)
         self.filter_menu.add_separator()
         self.filter_menu.add_command(label="Clear filters", command=self.clear_filters)
@@ -1365,6 +1409,8 @@ class RecoveryWindow(tk.Tk):
         self.facet_filter = None
         self.page_number = 0
         self.search.set("")
+        self.year_filter.set("All dates")
+        self.bin_filter.set("All bin items")
         self.format.set("All file types")
         self.refresh_facets()
 
@@ -1402,8 +1448,17 @@ class RecoveryWindow(tk.Tk):
 
     def matches_filter(self, key):
         path = self.display_path(key)
+        if self.bin_view:
+            stamp = self.deleted_dates.get(key)
+            year = str(stamp.year) if stamp else "Unknown date"
+            if self.active_year not in ("All dates", year):
+                return False
+            origin = "Emptied only" if isinstance(self.files[key], Candidate) else "Still in bin"
+            if self.active_bin not in ("All bin items", origin):
+                return False
         return (self.query in str(path).casefold()
-                and self.extension in ("All file types", path.suffix.upper())
+                and (self.extension in ("All file types", path.suffix.upper()) or
+                     self.extension == "Photos and videos" and path.suffix.lower() in IMAGE_TYPES | VIDEO_TYPES)
                 and (self.facet_filter is None or self.facet_filter in self.facet_path(key)))
 
     def refresh_thumbnails(self):
@@ -1478,14 +1533,18 @@ class RecoveryWindow(tk.Tk):
         self.tree.delete(*self.tree.get_children())
         self.query = self.search.get().casefold()
         self.extension = self.format.get()
-        self.filter_button.configure(text="Filter" if self.extension == "All file types" else self.extension)
+        self.active_year = self.year_filter.get()
+        self.active_bin = self.bin_filter.get()
+        filters = [v for v in (self.extension, self.active_year, self.active_bin)
+                   if v not in ("All file types", "All dates", "All bin items")]
+        self.filter_button.configure(text=" · ".join(filters) or "Filter")
         keys = [key for key in self.files if self.matches_filter(key)]
         sort_key = {
             "Discovery order": int,
             "Name": lambda key: self.display_path(key).name.casefold(),
             "Type": lambda key: self.display_path(key).suffix.casefold(),
             "Size": lambda key: self.metadata[key].st_size,
-            "File date": lambda key: self.metadata[key].st_mtime,
+            "File date": lambda key: self.file_date(key),
             "Recoverability": lambda key: CHECKS[self.check_label(key)][0],
         }[self.sort.get()]
         if self.sort.get() not in ("Discovery order", "Name"):
@@ -1582,7 +1641,11 @@ class RecoveryWindow(tk.Tk):
         self.preview_symbol.pack(before=self.preview, anchor="w", pady=(6, 8))
         self.details.pack(anchor="w", fill="x", pady=(10, 6))
         folder = str(display.parent) if key in self.originals else "Original folder unknown"
-        self.details.configure(text=f"Name\n{display.name}\n\nSize\n{size_label(self.metadata[key].st_size)}"
+        bin_info = ""
+        if self.bin_view:
+            origin = "Emptied-bin record" if isinstance(path, Candidate) else "Still in Recycle Bin"
+            bin_info = f"\n\n{origin}\nDate deleted: {self.file_date(key)}"
+        self.details.configure(text=f"Name\n{display.name}\n\nSize\n{size_label(self.metadata[key].st_size)}{bin_info}"
                                     f"\n\nType\n{display.suffix.upper().lstrip('.')} file\n\nPath\n{folder}\n\nRecovery evidence\n{self.check_label(key)}")
         suffix = display.suffix.lower()
         media = suffix in IMAGE_TYPES or suffix in VIDEO_TYPES
@@ -1590,19 +1653,123 @@ class RecoveryWindow(tk.Tk):
         if isinstance(path, Candidate):
             output = self.materialized.get(key)
             live_preview = output is None and path.identity is None
-            can_preview_live = suffix in IMAGE_TYPES and path.st_size <= LIVE_PREVIEW_LIMIT
+            can_preview_live = path.st_size <= LIVE_PREVIEW_LIMIT
             if media and output is None and (live_preview and not can_preview_live
                                              or path.st_size > 64 * 1024 * 1024):
                 self.open_button.configure(state="disabled")
                 self.preview.configure(text=f"{display.name} · Recover this file to preview it.")
                 return
-        self.open_button.configure(text="Play" if suffix in VIDEO_TYPES else "Preview",
+        self.open_button.configure(text="Play" if suffix in VIDEO_TYPES and not live_preview else "Preview",
                                    state="normal" if media and not live_preview else "disabled")
         self.preview.configure(text="Loading preview…" if media
                                else f"{display.name} · Preview unavailable")
         if media:
             self.preview_pending = key, path, suffix
             self.start_preview()
+
+    @staticmethod
+    def read_media(path, suffix):
+        if isinstance(path, Candidate):
+            if path.identity is not None and suffix in VIDEO_TYPES and path.st_size <= 64 * 1024 * 1024:
+                with tempfile.TemporaryDirectory(dir=RUNS.name) as folder:
+                    output = Path(folder) / ("preview" + suffix)
+                    extract_ntfs(path, output)
+                    return decode_preview(output, suffix)
+            limit = LIVE_PREVIEW_LIMIT if path.identity is None else 64 * 1024 * 1024
+            with preview_bytes(path, limit) as data:
+                return decode_preview(data, suffix)
+        return decode_preview(path, suffix)
+
+    def open_gallery(self):
+        if self.gallery is not None and self.gallery.winfo_exists():
+            self.gallery.lift()
+            return
+        self.format.set("Photos and videos")
+        window = self.gallery = tk.Toplevel(self)
+        window.title("Digger · Media gallery")
+        window.transient(self)
+        window.configure(bg=BG)
+        grid = ttk.Frame(window, padding=8)
+        grid.pack(fill="both", expand=True)
+        footer = ttk.Frame(window, padding=8)
+        footer.pack(fill="x")
+        status = ttk.Label(footer)
+        status.pack(side="left")
+        offset = 0
+        displayed = None
+        output = queue.SimpleQueue()
+        worker = None
+        pending = []
+        buttons = {}
+        def turn(delta):
+            nonlocal offset
+            offset += delta * 6
+            if offset >= self.shown_count and self.next_page.instate(["!disabled"]):
+                self.change_page(1)
+                offset = 0
+            elif offset < 0 and self.prev_page.instate(["!disabled"]):
+                self.change_page(-1)
+                offset = ((self.shown_count-1)//6)*6
+        forward = ttk.Button(footer, text="Next ›", command=lambda: turn(1))
+        forward.pack(side="right")
+        back = ttk.Button(footer, text="‹ Previous", command=lambda: turn(-1))
+        back.pack(side="right", padx=4)
+        def inspect(key):
+            self.tree.selection_set(key)
+            self.tree.see(key)
+            self.tree.focus(key)
+            window.destroy()
+            self.show_preview()
+        def tile(key, path, suffix):
+            try:
+                pic, _ = self.read_media(path, suffix)
+                pic.thumbnail((150, 92))
+            except (OSError, RuntimeError, ValueError, SyntaxError, subprocess.SubprocessError, Image.DecompressionBombError):
+                pic = None
+            output.put((key, pic))
+        def refresh():
+            nonlocal offset, displayed, worker
+            keys = []
+            for row in self.tree.get_children():
+                keys.extend([row] if row in self.files else self.tree.get_children(row))
+            offset = max(0, min(offset, max(0, (len(keys)-1)//6*6)))
+            visible = tuple(keys[offset:offset+6])
+            if visible != displayed:
+                displayed = visible
+                for child in grid.winfo_children():
+                    child.destroy()
+                buttons.clear()
+                pending.clear()
+                for index, key in enumerate(visible):
+                    name = self.display_path(key)
+                    suffix = name.suffix.lower()
+                    button = tk.Button(grid, text=name.name, wraplength=155, compound="top", bg=PANEL,
+                                       fg=TEXT, activebackground=SELECT, activeforeground=TEXT,
+                                       image=self.large_icons[GROUP_BY_SUFFIX.get(suffix,"Other files")],
+                                       width=168, height=138, relief="flat", command=lambda k=key: inspect(k))
+                    button.grid(row=index//3, column=index%3, padx=4, pady=4)
+                    buttons[key] = button
+                    if suffix in IMAGE_TYPES | VIDEO_TYPES:
+                        pending.append((key, self.materialized.get(key,self.files[key]), suffix))
+            try:
+                key, pic = output.get_nowait()
+                worker = None
+                if pic is not None and key in buttons:
+                    image = ImageTk.PhotoImage(pic)
+                    buttons[key].configure(image=image)
+                    buttons[key].image = image
+            except queue.Empty:
+                pass
+            if worker is None and pending:
+                worker = threading.Thread(target=tile, args=pending.pop(0), daemon=True)
+                worker.start()
+            first = self.page_number*self.page_size+offset
+            status.configure(text=f"{first+1}–{first+len(visible)} of {self.match_count:,}" if visible else "No matching media found")
+            back.configure(state="normal" if first else "disabled")
+            forward.configure(state="normal" if first+len(visible)<self.match_count else "disabled")
+            window.after(140, refresh)
+        window.bind("<Escape>",lambda _:window.destroy())
+        refresh()
 
     def start_preview(self):
         if self.preview_active or self.preview_pending is None:
@@ -1614,18 +1781,7 @@ class RecoveryWindow(tk.Tk):
 
         def work():
             try:
-                if saved_path is not None:
-                    picture, check = decode_preview(saved_path, suffix)
-                elif isinstance(path, Candidate) and path.identity is None:
-                    with preview_bytes(path, LIVE_PREVIEW_LIMIT) as data:
-                        picture, check = decode_preview(data, suffix)
-                elif isinstance(path, Candidate):
-                    with tempfile.TemporaryDirectory(dir=RUNS.name) as folder:
-                        output = Path(folder) / output_name(path.original.name)
-                        extract_ntfs(path, output)
-                        picture, check = decode_preview(output, suffix)
-                else:
-                    picture, check = decode_preview(path, suffix)
+                picture, check = self.read_media(saved_path or path, suffix)
             except (OSError, ValueError, RuntimeError, SyntaxError, subprocess.SubprocessError,
                     Image.DecompressionBombError):
                 picture, check = None, "Preview failed"
@@ -1697,7 +1853,7 @@ class RecoveryWindow(tk.Tk):
         if self.preview_bitmap is None or self.preview_key is None:
             return self.open_file()
         path = self.display_path(self.preview_key)
-        if path.suffix.lower() in VIDEO_TYPES:
+        if path.suffix.lower() in VIDEO_TYPES and self.open_button["text"] == "Play":
             return self.open_file()
         viewer = tk.Toplevel(self)
         viewer.title(path.name)
@@ -1776,13 +1932,13 @@ class RecoveryWindow(tk.Tk):
             self.validate_destination(self.files, destination.parent)
             with destination.open("w", encoding="utf-8-sig", newline="") as stream:
                 report = csv.writer(stream)
-                report.writerow(("Path", "Size (bytes)", "File date", "Evidence"))
+                report.writerow(("Path", "Size (bytes)", "Date modified", "Date deleted", "Evidence"))
                 for key in self.files:
                     path = str(self.display_path(key))
                     # Keep recovered filenames from being interpreted as spreadsheet formulas.
                     if path.lstrip().startswith(("=", "+", "-", "@")):
                         path = "'" + path
-                    report.writerow((path, self.metadata[key].st_size, self.file_date(key), self.check_label(key)))
+                    report.writerow((path, self.metadata[key].st_size, self.modified_date(key), self.file_date(key) if self.bin_view else "", self.check_label(key)))
         except OSError as exc:
             messagebox.showerror("Save scan report", str(exc))
 

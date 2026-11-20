@@ -1,4 +1,5 @@
 """Read copies of files retained by the current user's Windows Recycle Bin."""
+from datetime import datetime
 import ctypes
 import os
 from pathlib import Path, PureWindowsPath
@@ -31,10 +32,16 @@ def current_user_bins():
             yield Path(root) / "$Recycle.Bin" / match.group()
 
 
-def original_path(record):
-    with record.open("rb") as stream:
-        data = stream.read(MAX_RECORD + 1)
-    return decode_original_path(data)
+def bin_metadata(data):
+    path = decode_original_path(data)
+    if path is None:
+        return None, None
+    ticks = struct.unpack_from("<Q", data, 16)[0]
+    try:
+        deleted = datetime.fromtimestamp((ticks - 116444736000000000) // 10000000) if ticks else None
+    except (OverflowError, OSError, ValueError):
+        deleted = None
+    return path, deleted
 
 
 def decode_original_path(data):
@@ -101,7 +108,8 @@ def scan_recycle_bin(folder=None, bins=None, cancelled=lambda: False):
             try:
                 if not ordinary(record):
                     continue
-                original = original_path(record)
+                with record.open("rb") as stream:
+                    original, deleted = bin_metadata(stream.read(MAX_RECORD + 1))
                 if original is None:
                     continue
                 if scope and not (original.is_relative_to(scope) or scope.is_relative_to(original)):
@@ -112,7 +120,7 @@ def scan_recycle_bin(folder=None, bins=None, cancelled=lambda: False):
                         return
                     target = original.joinpath(*source.relative_to(payload).parts)
                     if scope is None or target.is_relative_to(scope):
-                        yield source, target
+                        yield source, target, deleted
             except (OSError, UnicodeError, ValueError):
                 # The Recycle Bin can change while a scan is running.
                 continue
@@ -134,23 +142,24 @@ def emptied_items(bin_path, job, folder=None):
         if token[:2].upper() == "$I" and len(parts) == 1:
             try:
                 with preview_bytes(entry, MAX_RECORD) as data:
-                    original = decode_original_path(data.read())
+                    original, deleted = bin_metadata(data.read())
             except (OSError, UnicodeError, ValueError):
                 original = None
             if original and original.drive.casefold() == scope.drive.casefold():
-                names[key] = original
+                names[key] = (original, deleted)
                 for payload, tail in pending.pop(key, []):
                     location = original.joinpath(*tail)
                     if folder is None or location.is_relative_to(folder):
-                        yield payload, location
+                        yield payload, location, deleted
         elif token[:2].upper() == "$R":
             if key in names:
-                location = names[key].joinpath(*parts[1:])
+                original, deleted = names[key]
+                location = original.joinpath(*parts[1:])
                 if folder is None or location.is_relative_to(folder):
-                    yield entry, location
+                    yield entry, location, deleted
             else:
                 pending.setdefault(key, []).append((entry, parts[1:]))
     if folder is None:
         for items in pending.values():
             for entry, _ in items:
-                yield entry, entry.original
+                yield entry, entry.original, None

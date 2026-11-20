@@ -20,12 +20,14 @@ def decode_preview(path, suffix=None):
     if suffix not in VIDEO_TYPES:
         return None, "Unchecked"
 
+    in_memory = isinstance(path, io.BytesIO)
     command = [str(FFMPEG), "-nostdin", "-hide_banner", "-loglevel", "error",
-               "-protocol_whitelist", "file,pipe", "-threads", "2", "-i", str(path),
+               "-protocol_whitelist", "pipe" if in_memory else "file,pipe", "-threads", "2", "-i", "pipe:0" if in_memory else str(path),
                "-map", "0:v:0", "-frames:v", "1", "-vf",
                "scale=1280:720:force_original_aspect_ratio=decrease", "-an",
                "-threads", "1", "-f", "image2pipe", "-vcodec", "png", "pipe:1"]
-    result = subprocess.run(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+    result = subprocess.run(command, input=path.getvalue() if in_memory else None,
+                            stdin=None if in_memory else subprocess.DEVNULL, stdout=subprocess.PIPE,
                             stderr=subprocess.DEVNULL, timeout=12, check=True,
                             creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
     with Image.open(io.BytesIO(result.stdout)) as frame:

@@ -11,6 +11,12 @@ Extract the ZIP and run **Digger.exe**. The x64 desktop app runs offline. Keep t
 - **Deep scan image** uses PhotoRec to carve files from a raw disk image. It can find data after filesystem metadata is gone. PhotoRec assigns new filenames. This workflow needs temporary space for a read-only copy of the image and recovered files.
 - **Inspect image** lists partitions with TestDisk. **Test deleted-file recovery** opens a synthetic NTFS image in a temporary folder on a healthy drive you choose, recovers a known deleted file, and compares its SHA-256 digest with the original. The scan banner stays visible on both Locations and Results. Canceling changes to Scan canceled after the worker exits. Partial results remain available.
 
+## Find older photos and videos from the Recycle Bin
+
+Run Digger as administrator and choose **Recycle Bin** to include emptied records. Open **Media gallery** to browse photos and videos as results arrive. Under **Filter**, choose **Bin status → Emptied only** and the year under **Date deleted**. The date comes from the Windows bin record. Select **Unknown date** to include items whose deletion date was lost. Click a thumbnail to inspect it, then select the files to recover. The gallery and inspector can decode a frame from live deleted videos up to 16 MiB. Recover larger live videos to a separate disk for playback.
+
+If the bin records are gone, choose **Search a drive for missing media…** and select the original volume for a PhotoRec scan. Carved files may lose their original path, deletion date and connection to the bin.
+
 ## Select and recover
 
 Enter part of a filename before starting, or search while the scan runs. Checkboxes keep files selected across pages and filters. You can recover checked files during an indexed scan. Stopping keeps results already found.
