@@ -59,6 +59,10 @@ def run_job(job, on_progress=None):
         "recover": [str(engine_path("photorec")), "/d", "files",
                     "/cmd", "source.img", "partition_none,wholespace,search"],
     }
+    if job["mode"] == "formatted":
+        signatures = "fileopt,everything,disable,mov,enable," if job["movies_only"] else ""
+        commands["formatted"] = [str(engine_path("photorec")), "/d", "files", "/cmd", job["device"],
+                                 "partition_none," + signatures + "wholespace,search"]
     try:
         env = {**os.environ, "TERM": "xterm", "LC_ALL": "C"}
         if WINDOWS:

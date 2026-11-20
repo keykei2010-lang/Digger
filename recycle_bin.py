@@ -34,6 +34,10 @@ def current_user_bins():
 def original_path(record):
     with record.open("rb") as stream:
         data = stream.read(MAX_RECORD + 1)
+    return decode_original_path(data)
+
+
+def decode_original_path(data):
     if len(data) < 26 or len(data) > MAX_RECORD:
         return None
     version, _, _ = struct.unpack_from("<QQQ", data)
@@ -112,3 +116,41 @@ def scan_recycle_bin(folder=None, bins=None, cancelled=lambda: False):
             except (OSError, UnicodeError, ValueError):
                 # The Recycle Bin can change while a scan is running.
                 continue
+
+def emptied_items(bin_path, job, folder=None):
+    """Pair a deleted $R payload with surviving $I metadata within one user's bin."""
+    from ntfs_recovery import preview_bytes, scan
+    from windows_volumes import source_volume
+
+    scope = PureWindowsPath(bin_path)
+    names = {}
+    pending = {}
+    for entry in scan(source_volume(scope), scope, job, include_bin_metadata=True):
+        parts = entry.original.relative_to(scope).parts
+        if not parts:
+            continue
+        token = parts[0]
+        key = token[2:].casefold()
+        if token[:2].upper() == "$I" and len(parts) == 1:
+            try:
+                with preview_bytes(entry, MAX_RECORD) as data:
+                    original = decode_original_path(data.read())
+            except (OSError, UnicodeError, ValueError):
+                original = None
+            if original and original.drive.casefold() == scope.drive.casefold():
+                names[key] = original
+                for payload, tail in pending.pop(key, []):
+                    location = original.joinpath(*tail)
+                    if folder is None or location.is_relative_to(folder):
+                        yield payload, location
+        elif token[:2].upper() == "$R":
+            if key in names:
+                location = names[key].joinpath(*parts[1:])
+                if folder is None or location.is_relative_to(folder):
+                    yield entry, location
+            else:
+                pending.setdefault(key, []).append((entry, parts[1:]))
+    if folder is None:
+        for items in pending.values():
+            for entry, _ in items:
+                yield entry, entry.original

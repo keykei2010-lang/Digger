@@ -12,6 +12,7 @@ class CarvedResults:
         self.parser = XMLPullParser(events=("start", "end"))
         self.root = None
         self.seen = set()
+        self.source_size = 0
 
     def read(self):
         if self.parser is None:
@@ -25,6 +26,8 @@ class CarvedResults:
                     for event, node in self.parser.read_events():
                         if self.root is None:
                             self.root = node
+                        if event == "end" and node.tag == "image_size" and (node.text or "").isdecimal():
+                            self.source_size = int(node.text)
                         if event == "end" and node.tag == "fileobject":
                             self.add(node)
                             self.root.remove(node)

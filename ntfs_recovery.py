@@ -105,7 +105,7 @@ def filesystem_at(source, offset):
     return None
 
 
-def scan(source, scope, job):
+def scan(source, scope, job, include_bin_metadata=False):
     fingerprint = None if scope is not None else identity(source)
     offsets = [0] if scope is not None else [0, *partition_offsets(source, job)]
     readable = False
@@ -143,7 +143,7 @@ def scan(source, scope, job):
                     continue
                 if scope is not None and not row.original.is_relative_to(scope):
                     continue
-                if scope is not None and row.original.parts[1:2] and row.original.parts[1].casefold() == "$recycle.bin":
+                if not include_bin_metadata and scope is not None and row.original.parts[1:2] and row.original.parts[1].casefold() == "$recycle.bin":
                     # Cleared-bin payload records can survive under their Windows $R name.
                     if not any(part.casefold().startswith("$r") for part in row.original.parts[2:]):
                         continue
