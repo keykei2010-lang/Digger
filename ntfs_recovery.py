@@ -40,9 +40,9 @@ def identity(path):
 
 
 def safe_name(text):
-    return (text not in {"", ".", ".."} and text == text.rstrip(" .")
-            and not re.search(r'[<>:"/\\|?*\x00-\x1f]', text)
-            and not PureWindowsPath(text).is_reserved())
+    # Trailing dots/spaces and device names are legal on NTFS, so they are kept
+    # here and made safe when the file is written (recovery_output.output_name).
+    return text not in {"", ".", ".."} and not re.search(r'[<>:"/\\|?*\x00-\x1f]', text)
 
 
 def body_entry(line, source, offset, volume, fingerprint, filesystem="ntfs"):
@@ -159,7 +159,13 @@ def scan(source, scope, job, include_bin_metadata=False):
             readable = True
         else:
             messages.append(errors.decode("utf-8", "replace").strip())
-    if (not readable or any(messages)) and job["status"] != "stopping":
+    if job["status"] == "stopping":
+        return
+    if readable and any(messages):
+        # Results from the readable partitions are already delivered; report the rest.
+        job.setdefault("warnings", []).append(
+            "Some partitions could not be read and were skipped.\n" + next(m for m in messages if m))
+    elif not readable:
         detail = next((message for message in messages if message), "")
         hint = ("The selected volume must be NTFS and the app must run as administrator."
                 if scope is not None else "Choose a raw disk or volume image containing NTFS, FAT, or exFAT.")
@@ -185,7 +191,7 @@ def ntfs_record(entry):
     virtual_name = ("$OrphanFiles" in entry.original.parts and
                     entry.original.name == f"OrphanFile-{entry.inode.split('-')[0]}")
     if not virtual_name and not any(
-        line.strip().decode("utf-8", "replace").casefold() == f"name: {entry.original.name}".casefold()
+        line.strip().decode("utf-8", "replace").casefold() == f"name: {entry.original.name}".strip().casefold()
         for line in output.splitlines()
     ):
         raise OSError("The deleted NTFS entry name changed. Scan the drive again.")

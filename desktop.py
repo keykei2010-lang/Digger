@@ -22,7 +22,7 @@ from tkinter import filedialog, messagebox, ttk
 from PIL import Image, ImageDraw, ImageTk
 
 from carved_results import CarvedResults
-from recovery_output import atomic_output
+from recovery_output import atomic_output, output_name
 from ntfs_recovery import Candidate, extract as extract_ntfs, preview_bytes, scan as scan_ntfs
 from windows_volumes import is_elevated, local_volumes, require_separate_disk, selected_scope, source_volume
 
@@ -522,14 +522,15 @@ class RecoveryWindow(tk.Tk):
         self.name_hint.set(options.name)
         self.movie_filter.set("MP4 / MOV movies" if options.movies else "All file types")
 
-    def show_admin_warning(self):
+    def show_admin_warning(self, title="Administrator access required",
+                           text="To start this scan, right-click Digger.exe and choose Run as administrator."):
         if self.admin_warning is not None and self.admin_warning.winfo_exists():
             self.admin_warning.destroy()
         panel = self.admin_warning = tk.Frame(self, bg=SURFACE, padx=14, pady=10,
                                                highlightbackground="#e4b75f", highlightthickness=1)
-        tk.Label(panel, text="Administrator access required", anchor="w", bg=SURFACE,
+        tk.Label(panel, text=title, anchor="w", bg=SURFACE,
                  fg="#ffd484", font=("Segoe UI Semibold", 11)).grid(row=0, column=0, sticky="w")
-        tk.Label(panel, text="To start this scan, right-click Digger.exe and choose Run as administrator.",
+        tk.Label(panel, text=text,
                  wraplength=330, justify="left", bg=SURFACE, fg=TEXT).grid(row=1, column=0, sticky="w")
         tk.Button(panel, text="Dismiss", bg=SURFACE, fg=TEXT, activebackground=SELECT, activeforeground=TEXT,
                   relief="flat", command=panel.destroy).grid(row=0, column=1, padx=(8, 0))
@@ -788,7 +789,9 @@ class RecoveryWindow(tk.Tk):
         elif mode == "formatted":
             text = "Scan the entire mounted volume for file contents. Digger saves discoveries to a different physical disk."
         elif mode == "bin":
-            text = "List retained items, then search mounted NTFS drives for files removed when the bin was emptied."
+            text = ("List retained items, then search mounted NTFS drives for files removed when the bin was emptied."
+                    if self.elevated or not self.can_scan_drives else
+                    "Lists items still in the Recycle Bin. Run Digger as administrator to also find emptied-bin files.")
         elif mode == "folder":
             text = "Find Recycle Bin items originally deleted from this folder."
         else:
@@ -833,9 +836,15 @@ class RecoveryWindow(tk.Tk):
                 if not source.is_file():
                     messagebox.showerror("Scan source", "Choose an existing disk image file.")
                     return
-        if not sample and mode in ("live_ntfs", "formatted", "bin", "folder") and not self.elevated:
+        if not sample and mode in ("live_ntfs", "formatted") and not self.elevated:
             self.show_admin_warning()
             return
+        limited_bin = not sample and mode in ("bin", "folder") and not self.elevated
+        if limited_bin:
+            # Retained items need no elevation; only the emptied-bin search reads the raw volume.
+            self.show_admin_warning("Emptied-bin search needs administrator access",
+                                    "Showing items still in the Recycle Bin. To also find files removed when the bin "
+                                    "was emptied, right-click Digger.exe and choose Run as administrator.")
         if sample:
             location = filedialog.askdirectory(title="Choose a healthy drive for the 48 MiB recovery test")
             if not location:
@@ -869,7 +878,7 @@ class RecoveryWindow(tk.Tk):
         else:
             self.open_output.pack_forget()
         self.job = {"folder": folder, "mode": mode, "status": "preparing", "matches": deque(),
-                    "self_test": sample, "started": monotonic(), "source": str(source or ("Recycle Bin" if mode == "bin" else "Built-in NTFS test image"))}
+                    "self_test": sample, "limited": limited_bin, "started": monotonic(), "source": str(source or ("Recycle Bin" if mode == "bin" else "Built-in NTFS test image"))}
         if mode == "formatted":
             self.job.update(device=device, movies_only=self.movie_filter.get() == "MP4 / MOV movies")
         self.scan_source = self.job["source"]
@@ -993,6 +1002,8 @@ class RecoveryWindow(tk.Tk):
             if job["status"] == "stopping":
                 return
             job["matches"].append((source, original))
+        if job.get("limited"):
+            return
         volumes = {root.casefold() for root, _, fs in local_volumes() if fs.upper() == "NTFS"}
         searched = 0
         failures = []
@@ -1163,6 +1174,11 @@ class RecoveryWindow(tk.Tk):
         summary = f"{len(self.files):,} files found{detail}   ·   {elapsed}"
         if job["status"] == "stopped":
             summary += "   ·   Scanning has stopped. Partial results are available."
+        elif job.get("warnings") and not job.get("error"):
+            summary += "   ·   Some partitions were skipped"
+            self.set_log("\n\n".join(job["warnings"]))
+        elif job.get("limited") and not job.get("error"):
+            summary += "   ·   Emptied-bin search skipped (needs administrator)"
         elif job.get("error"):
             summary = job["error"].splitlines()[0]
         elif job["self_test"]:
@@ -1605,7 +1621,7 @@ class RecoveryWindow(tk.Tk):
                         picture, check = decode_preview(data, suffix)
                 elif isinstance(path, Candidate):
                     with tempfile.TemporaryDirectory(dir=RUNS.name) as folder:
-                        output = Path(folder) / path.original.name
+                        output = Path(folder) / output_name(path.original.name)
                         extract_ntfs(path, output)
                         picture, check = decode_preview(output, suffix)
                 else:
@@ -1709,7 +1725,7 @@ class RecoveryWindow(tk.Tk):
                     if path.identity is None or path.st_size > 64 * 1024 * 1024:
                         raise OSError("Recover this file before opening it.")
                     folder = Path(tempfile.mkdtemp(dir=RUNS.name))
-                    output = folder / path.original.name
+                    output = folder / output_name(path.original.name)
                     extract_ntfs(path, output)
                 path = output
             elif key in self.originals:
@@ -1908,8 +1924,9 @@ class RecoveryWindow(tk.Tk):
                 if original is not None:
                     if not isinstance(source, Candidate) and not ordinary(source):
                         raise OSError("The item is no longer available.")
-                    output = (destination.joinpath(original.drive.rstrip(":"), *original.parts[1:])
-                              if original.drive else destination.joinpath(*original.parts))
+                    parts = [output_name(part) for part in original.parts[1:]]
+                    output = (destination.joinpath(original.drive.rstrip(":"), *parts) if original.drive
+                              else destination.joinpath(output_name(original.parts[0]), *parts))
                 else:
                     output = destination / source.parent.name / source.name
                 output.parent.mkdir(parents=True, exist_ok=True)

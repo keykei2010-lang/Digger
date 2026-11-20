@@ -3,8 +3,21 @@ from contextlib import contextmanager
 import os
 import shutil
 import stat
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 import tempfile
+
+
+def output_name(name):
+    """Make one recovered path component safe to create on Windows.
+
+    NTFS can hold names Windows itself cannot create (trailing dots or spaces,
+    device names such as CON). Recover them under a harmless name instead of
+    skipping the file.
+    """
+    clean = name.rstrip(" .") or "_"
+    if PureWindowsPath(clean).is_reserved():
+        clean = "_" + clean
+    return clean
 
 
 @contextmanager

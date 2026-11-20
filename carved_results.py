@@ -30,7 +30,10 @@ class CarvedResults:
                             self.source_size = int(node.text)
                         if event == "end" and node.tag == "fileobject":
                             self.add(node)
-                            self.root.remove(node)
+                            try:
+                                self.root.remove(node)
+                            except ValueError:
+                                pass  # nested node; memory is released at exit
         except OSError:
             return
         except ParseError:

@@ -22,3 +22,7 @@ Select the files you want, click **Recover selected…**, and choose a destinati
 For ordinary NTFS runs Digger checks cluster allocation before extraction. It rejects files whose checked clusters are currently allocated and rechecks a live volume before publishing the file. The checks are bounded, and results without a complete allocation check use a more limited status. A deleted NTFS record means the filesystem metadata is still present. Recovering the expected number of bytes does not prove that the original content survived an overwrite or SSD TRIM. Preview checks report whether an image or one video frame decoded.
 
 The archive includes the CGSecurity TestDisk and PhotoRec engines, The Sleuth Kit, Python, Tk and FFmpeg. See the included licenses and source notices.
+
+## Administrator access
+
+Only scans that read a drive directly need it: **Deleted files**, **Formatted drive**, and the emptied-bin part of **Recycle Bin**. Disk images and items still in the Recycle Bin work without it. When a scan needs administrator access, Digger tells you in a pop-up, and Recycle Bin scans still list the retained items. To elevate, right-click Digger.exe and choose Run as administrator.
