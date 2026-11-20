@@ -249,7 +249,6 @@ class RecoveryWindow(tk.Tk):
             parser.add_argument("--source", default="")
             parser.add_argument("--name", default="")
             parser.add_argument("--movies", action="store_true")
-            parser.add_argument("--resume-scan", action="store_true")
             self.after_idle(self.restore_launch, parser.parse_args())
         self.after_idle(self.fade_in)
         self.after(150, self.refresh)
@@ -522,8 +521,6 @@ class RecoveryWindow(tk.Tk):
         self.source_text.set(options.source)
         self.name_hint.set(options.name)
         self.movie_filter.set("MP4 / MOV movies" if options.movies else "All file types")
-        if options.resume_scan:
-            self.start_scan(False)
 
     def show_admin_warning(self):
         if self.admin_warning is not None and self.admin_warning.winfo_exists():
@@ -742,7 +739,7 @@ class RecoveryWindow(tk.Tk):
             self.drives_box.pack(fill="x")
         if mode == "live_ntfs":
             self.locations_box.pack(fill="x", pady=(8,0))
-        if mode != "bin" and (self.options_open or mode not in ("live_ntfs","formatted")):
+        if mode != "bin":
             self.path_panel.pack(fill="x", pady=(8,0))
         self.options_button.configure(text="Hide scan options  ▴" if self.options_open else "Scan options  ▾")
         self.options_button.pack(anchor="w", pady=(10,0))
