@@ -1,4 +1,5 @@
 """Portable desktop interface for the bundled Windows recovery engines."""
+import argparse
 import csv
 import hashlib
 import lzma
@@ -180,12 +181,14 @@ class RecoveryWindow(tk.Tk):
         self.icons = {kind: file_icon(kind) for kind in kinds}
         self.large_icons = {kind: file_icon(kind, 56) for kind in kinds}
         self.build()
-        if len(sys.argv) == 5 and sys.argv[1] == "--mode" and sys.argv[3] == "--source":
-            self.mode.set(sys.argv[2])
-            self.change_source_mode()
-            self.source_text.set(sys.argv[4])
-        if len(sys.argv) == 3 and sys.argv[1] == "--source":
-            self.source_text.set(sys.argv[2])
+        if len(sys.argv) > 1:
+            parser = argparse.ArgumentParser()
+            parser.add_argument("--mode", choices=("live_ntfs", "formatted", "bin", "folder"), default="live_ntfs")
+            parser.add_argument("--source", default="")
+            parser.add_argument("--name", default="")
+            parser.add_argument("--movies", action="store_true")
+            parser.add_argument("--resume-scan", action="store_true")
+            self.after_idle(self.restore_launch, parser.parse_args())
         self.after_idle(self.fade_in)
         self.after(150, self.refresh)
 
@@ -366,19 +369,37 @@ class RecoveryWindow(tk.Tk):
             self.path_entry.selection_range(0, "end")
         return "break"
 
-    def elevate(self):
-        if not self.can_scan_drives:
+    def restore_launch(self, options):
+        self.mode.set(options.mode)
+        self.change_source_mode()
+        self.source_text.set(options.source)
+        self.name_hint.set(options.name)
+        self.movie_filter.set("MP4 / MOV movies" if options.movies else "All file types")
+        if options.resume_scan:
+            if self.elevated:
+                self.start_scan(False)
+            else:
+                self.activity.configure(text="Administrator access was not granted. Scan has not started.")
+
+    def elevate(self, resume_scan=False):
+        if not self.can_scan_drives or self.job is not None or self.saving:
             return
         script = Path(__file__).resolve()
         executable = Path(sys.executable).with_name("pythonw.exe")
-        arguments = subprocess.list2cmdline([str(script), "--mode", self.mode.get(), "--source", self.source_text.get()])
+        args = [str(script), "--mode=" + self.mode.get(), "--source=" + self.source_text.get(),
+                "--name=" + self.name_hint.get()]
+        if self.movie_filter.get() == "MP4 / MOV movies":
+            args.append("--movies")
+        if resume_scan:
+            args.append("--resume-scan")
+        arguments = subprocess.list2cmdline(args)
         run = ctypes.windll.shell32.ShellExecuteW
         run.argtypes = (ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_wchar_p,
                         ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_int)
         run.restype = ctypes.c_void_p
         result = run(None, "runas", str(executable), arguments, str(script.parent), 1)
         if not result or result <= 32:
-            messagebox.showerror("Administrator access", "Windows did not start Digger with administrator access.")
+            self.activity.configure(text="Administrator access was not granted. Scan has not started.")
         else:
             self.close()
 
@@ -625,10 +646,6 @@ class RecoveryWindow(tk.Tk):
         if sample:
             mode = "ntfs_image"
         source = None
-        if not sample and mode in ("live_ntfs", "formatted", "bin", "folder") and not self.elevated:
-            if messagebox.askyesno("Administrator access", "Reading deleted records or sectors requires administrator access. Restart Digger as administrator?"):
-                self.elevate()
-            return
         if not sample and mode != "bin":
             value = os.path.expandvars(self.source_text.get().strip().strip('"'))
             if not value:
@@ -648,6 +665,9 @@ class RecoveryWindow(tk.Tk):
                 if not source.is_file():
                     messagebox.showerror("Scan source", "Choose an existing disk image file.")
                     return
+        if not sample and mode in ("live_ntfs", "formatted", "bin", "folder") and not self.elevated:
+            self.elevate(resume_scan=True)
+            return
         if sample:
             location = filedialog.askdirectory(title="Choose a healthy drive for the 48 MiB recovery test")
             if not location:
