@@ -109,6 +109,41 @@ def file_icon(kind, size=20):
     return ImageTk.PhotoImage(picture.resize((size, size), Image.Resampling.LANCZOS))
 
 
+def location_icon(kind, size):
+    art = Image.new("RGBA", (96, 96))
+    d = ImageDraw.Draw(art)
+    dark, mid, light = "#374e6b", "#6788ad", "#9bbcdf"
+    if kind == "Drive":
+        d.polygon([(19,20),(75,20),(86,63),(11,63)], fill=mid)
+        d.ellipse((32,29,67,63), fill=light)
+        d.ellipse((44,41,55,51), fill=dark)
+        d.rounded_rectangle((10,55,86,81),radius=6,fill=dark,outline=mid,width=2)
+        d.line((20,67,60,67),fill=mid,width=2)
+        d.ellipse((73,64,78,69),fill="#65d8c7")
+    elif kind == "Desktop":
+        d.rounded_rectangle((4,9,91,69),radius=7,fill=dark)
+        for y in range(15,61):
+            d.line((10,y,85,y), fill=(83-y//3,122-y//3,161-y//3))
+        d.rectangle((43,69,53,78),fill=mid)
+        d.rounded_rectangle((30,78,66,82),radius=2,fill=dark)
+    elif kind == "Bin":
+        d.polygon([(14,18),(82,18),(72,81),(25,81)],fill=mid)
+        d.rounded_rectangle((12,12,84,23),radius=4,fill=light)
+        for x in (34,47,60):
+            d.rounded_rectangle((x,32,x+4,66),radius=2,fill="#b4d4ee")
+    elif kind == "Folder":
+        d.rounded_rectangle((6,18,47,46),radius=6,fill=mid)
+        d.rounded_rectangle((6,29,90,79),radius=6,fill=dark)
+        d.line((12,33,83,33),fill=light,width=3)
+    else:
+        d.rounded_rectangle((15,11,80,83),radius=7,fill=mid)
+        d.ellipse((24,20,72,68),fill=light)
+        d.pieslice((24,20,72,68),230,280,fill="#d6e7fa")
+        d.ellipse((41,37,55,51),fill=dark)
+        d.rounded_rectangle((19,68,76,78),radius=3,fill=dark)
+    return ImageTk.PhotoImage(art.resize((size,size),Image.Resampling.LANCZOS))
+
+
 def row_images(picture):
     icons = []
     for checked in (False, True, None):
@@ -286,7 +321,7 @@ class RecoveryWindow(tk.Tk):
         style.configure("Workspace.TNotebook", borderwidth=0, lightcolor=BG, darkcolor=BG)
         self.tabs = ttk.Notebook(body, style="Workspace.TNotebook")
         self.tabs.pack(fill="both", expand=True)
-        self.scan_page = ttk.Frame(self.tabs, padding=20)
+        self.scan_page = ttk.Frame(self.tabs)
         self.results_page = ttk.Frame(self.tabs)
         self.tabs.add(self.scan_page, text="  New scan  ")
         self.tabs.add(self.results_page, text="  Scan results  ")
@@ -300,104 +335,182 @@ class RecoveryWindow(tk.Tk):
         ttk.Button(top, text="Results", command=lambda: self.tabs.select(self.results_page)).pack(side="right")
         self.build_scan()
         self.build_results()
+        def sync_status(_event=None):
+            visible = self.tabs.select() == str(self.results_page) or self.job is not None
+            if visible and not self.banner.winfo_manager():
+                self.banner.pack(before=body, side="bottom", fill="x")
+                self.activity.pack(before=body, side="bottom", fill="x")
+            elif not visible:
+                self.banner.pack_forget()
+                self.activity.pack_forget()
+        self.tabs.bind("<<NotebookTabChanged>>", sync_status)
+        sync_status()
 
     def build_scan(self):
         page = self.scan_page
-        heading = tk.Frame(page, bg=BG)
-        heading.pack(fill="x", pady=(0, 18))
-        tk.Label(heading, text="Find deleted files", font=("Segoe UI Semibold", 28), bg=BG,
-                 fg=TEXT).pack(anchor="w")
-        tk.Label(heading, text="Select a drive or enter the folder the file was deleted from.",
-                 bg=BG, fg=MUTED, font=("Segoe UI", 11)).pack(anchor="w", pady=(4, 0))
-
-        modes = ttk.Frame(page)
-        modes.pack(fill="x", pady=(0, 15))
-        for value, label in (("live_ntfs", "Deleted files"), ("bin", "Recycle Bin"),
-                             ("formatted", "Formatted drive"), ("ntfs_image", "Disk image")):
-            ttk.Radiobutton(modes, style="Toolbutton", text=label, value=value, variable=self.mode,
-                            command=self.change_source_mode).pack(side="left", padx=(0, 20))
-        advanced = ttk.Menubutton(modes, text="More scans")
-        menu = tk.Menu(advanced, tearoff=False, bg=SURFACE, fg=TEXT)
-        for value, label in (("folder", "Recycle Bin by folder"), ("recover", "Deep scan image"),
-                             ("inspect", "Inspect image")):
-            menu.add_radiobutton(label=label, value=value, variable=self.mode, command=self.change_source_mode)
-        advanced.configure(menu=menu)
-        advanced.pack(side="left")
-
-        self.drive_panel = ttk.Frame(page)
-        title = ttk.Frame(self.drive_panel)
-        title.pack(fill="x", pady=(0, 6))
-        ttk.Label(title, text="DRIVES", foreground=MUTED).pack(side="left")
-        ttk.Button(title, text="Refresh", command=self.refresh_drives).pack(side="right")
-        self.drive_list = ttk.Treeview(self.drive_panel, columns=("drive", "volume", "filesystem"),
-                                       show="headings", selectmode="browse", height=4)
-        for key, label, width in (("drive", "Drive", 85), ("volume", "Volume", 250),
-                                  ("filesystem", "File system", 115)):
-            self.drive_list.heading(key, text=label)
-            self.drive_list.column(key, width=width, minwidth=65)
-        self.drive_list.pack(fill="x")
-        self.drive_list.bind("<<TreeviewSelect>>", self.select_drive)
-        self.drive_list.bind("<Double-1>", lambda _: self.start_scan(False))
-        self.drive_panel.pack(fill="x", pady=(0, 14))
-
-        self.path_panel = ttk.Frame(page)
-        self.path_panel.pack(fill="x", pady=(0, 7))
-        self.path_label = ttk.Label(self.path_panel, text="Drive or folder path", foreground=MUTED)
+        rail = tk.Frame(page, bg=DARK, width=206)
+        rail.pack(side="left", fill="y")
+        rail.pack_propagate(False)
+        self.nav_buttons = {}
+        sidebar = (("Data recovery", (("live_ntfs", "Hardware disk", "Drive"), ("bin", "Recycle Bin", "Bin"),
+                                     ("ntfs_image", "Disk image", "Image"))),
+                   ("Advanced recovery", (("formatted", "Formatted drive", "Drive"), ("recover", "Deep scan image", "Image"),
+                                          ("inspect", "Inspect partitions", "Image"), ("folder", "Bin by folder", "Folder"))))
+        self.location_icons = {(kind, size): location_icon(kind, size) for kind in
+                               ("Drive", "Bin", "Desktop", "Folder", "Image") for size in (21, 48)}
+        for section, items in sidebar:
+            tk.Label(rail, text=section, bg=DARK, fg="#9b9fa9", font=("Segoe UI", 9)).pack(anchor="w", padx=18, pady=(24, 8))
+            for mode, title, kind in items:
+                button = tk.Button(rail, text="  " + title, image=self.location_icons[kind, 21], compound="left",
+                                   anchor="w", padx=12, pady=7, bg=DARK, fg=TEXT, bd=0, relief="flat",
+                                   activebackground=SELECT, activeforeground=TEXT, cursor="hand2",
+                                   command=lambda m=mode: self.pick_mode(m))
+                button.pack(fill="x", padx=8, pady=2)
+                self.nav_buttons[mode] = button
+        self.demo = tk.Button(rail, text="Test deleted-file recovery", bg=DARK, fg=MUTED, bd=0,
+                              activebackground=SELECT, activeforeground=TEXT, command=lambda: self.start_scan(True))
+        self.demo.pack(side="bottom", anchor="w", padx=16, pady=16)
+        main = tk.Frame(page, bg=BG)
+        main.pack(fill="both", expand=True)
+        footer = tk.Frame(main, bg=BG, highlightthickness=1, highlightbackground=SURFACE)
+        footer.pack(side="bottom", fill="x")
+        self.start_button = ttk.Button(footer, text="Search for lost data", style="Digger.TButton",
+                                       command=lambda: self.start_scan(False))
+        self.start_button.pack(side="right", padx=16, pady=12)
+        self.source_label = tk.Label(footer, anchor="w", bg=BG, fg=MUTED, wraplength=360, justify="left")
+        self.source_label.pack(side="left", fill="x", expand=True, padx=16)
+        viewport = tk.Canvas(main, bg=BG, bd=0, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(main, orient="vertical", command=viewport.yview)
+        scrollbar.pack(side="right", fill="y")
+        viewport.pack(fill="both", expand=True)
+        self.location_content = content = tk.Frame(viewport, bg=BG, padx=26, pady=22)
+        window = viewport.create_window(0, 0, anchor="nw", window=content)
+        content.bind("<Configure>", lambda _: viewport.configure(scrollregion=viewport.bbox("all")))
+        viewport.bind("<Configure>", lambda e: viewport.itemconfigure(window, width=e.width))
+        self.bind("<MouseWheel>", lambda e: viewport.yview_scroll(-int(e.delta/120), "units")
+                  if self.tabs.select() == str(page) and viewport.yview() != (0., 1.) else None, add="+")
+        heading = tk.Frame(content, bg=BG)
+        heading.pack(fill="x", pady=(4, 20))
+        self.location_heading = tk.Label(heading, bg=BG, fg=TEXT, font=("Segoe UI Semibold", 16))
+        self.location_heading.pack(side="left")
+        tk.Button(heading, text="↻", bg=BG, fg=MUTED, bd=0, font=("Segoe UI", 14),
+                  activebackground=BG, activeforeground=TEXT, command=self.refresh_drives).pack(side="left", padx=8)
+        self.drives_box = tk.Frame(content, bg=BG)
+        self.drives_box.pack(fill="x")
+        self.locations_box = tk.Frame(content, bg=BG)
+        self.locations_box.pack(fill="x", pady=(12, 0))
+        tk.Label(self.locations_box, text="Specify a location", bg=BG, fg=MUTED).pack(anchor="w", pady=(0, 10))
+        shortcuts = tk.Frame(self.locations_box, bg=BG)
+        shortcuts.pack(fill="x")
+        for index, (kind, title) in enumerate((("Bin","Recycle Bin"), ("Desktop","Desktop"), ("Folder","Select folder"), ("Image","Disk image"))):
+            button = tk.Button(shortcuts, text="   " + title, image=self.location_icons[kind,48], compound="left",
+                               anchor="w", bg=BG, fg=TEXT, activebackground=SELECT, activeforeground=TEXT,
+                               padx=6, pady=10, bd=0, cursor="hand2", command=lambda k=kind: self.shortcut(k))
+            button.grid(row=index//3, column=index%3, sticky="ew", pady=3)
+            shortcuts.columnconfigure(index%3, weight=1)
+        self.path_panel = ttk.Frame(content)
+        self.path_label = ttk.Label(self.path_panel, foreground=MUTED)
         self.path_label.pack(anchor="w", pady=(0, 5))
-        entry_line = ttk.Frame(self.path_panel)
-        entry_line.pack(fill="x")
-        self.path_entry = ttk.Entry(entry_line, textvariable=self.source_text)
+        self.path_entry = ttk.Entry(self.path_panel, textvariable=self.source_text)
         self.path_entry.pack(side="left", fill="x", expand=True)
         self.path_entry.bind("<Return>", lambda _: self.start_scan(False))
-        self.browse = ttk.Button(entry_line, text="Browse…", command=self.choose_source)
-        self.browse.pack(side="left", padx=(7, 0))
-
-        self.hint_box = hint_box = ttk.Frame(page)
-        hint_box.pack(fill="x", pady=(4, 12))
-        ttk.Label(hint_box, text="File name contains (optional)", foreground=MUTED).pack(anchor="w")
-        ttk.Entry(hint_box, textvariable=self.name_hint, width=36).pack(anchor="w", pady=(4, 0))
-        self.carve_options = ttk.Frame(page)
-        ttk.Label(self.carve_options, text="Look for").pack(side="left", padx=(0, 8))
+        ttk.Button(self.path_panel, text="Browse…", command=self.choose_source).pack(side="left", padx=(6,0))
+        self.options_button = tk.Button(content, text="Scan options  ▾", bg=BG, fg=MUTED, bd=0,
+                                        activebackground=BG, activeforeground=TEXT, command=self.toggle_options)
+        self.options_button.pack(anchor="w", pady=(12, 0))
+        self.hint_box = ttk.Frame(content)
+        ttk.Label(self.hint_box, text="File name contains").pack(side="left")
+        ttk.Entry(self.hint_box, textvariable=self.name_hint, width=26).pack(side="left", padx=8)
+        self.carve_options = ttk.Frame(content)
+        ttk.Label(self.carve_options, text="Look for").pack(side="left")
         ttk.Combobox(self.carve_options, state="readonly", textvariable=self.movie_filter,
-                     values=("All file types", "MP4 / MOV movies"), width=24).pack(side="left")
-        self.source_label = ttk.Label(page, foreground=MUTED, wraplength=840)
-        self.source_label.pack(anchor="w", pady=(0, 10))
-        actions = ttk.Frame(page)
-        actions.pack(fill="x", pady=4)
-        self.demo = ttk.Button(actions, text="Test deleted-file recovery", command=lambda: self.start_scan(True))
-        self.demo.pack(side="left")
-        self.elevation_button = ttk.Button(actions, text="Run as administrator", command=self.elevate)
-        self.start_button = ttk.Button(actions, text="Scan for deleted files", style="Digger.TButton",
-                                       command=lambda: self.start_scan(False), state="disabled")
-        self.start_button.pack(side="right")
+                     values=("All file types", "MP4 / MOV movies"), width=24).pack(side="left", padx=8)
+        self.cards = {}
+        self.volume_names = {}
+        self.options_open = False
         self.source_text.trace_add("write", lambda *_: self.update_source())
         self.bind("<Control-l>", self.focus_path)
         self.refresh_drives()
         self.change_source_mode()
 
-    def refresh_drives(self):
-        self.drive_list.delete(*self.drive_list.get_children())
-        self.drive_roots.clear()
-        if not self.can_scan_drives:
-            return
-        for root, name, filesystem in local_volumes():
-            row = self.drive_list.insert("", "end", values=(root, name, filesystem))
-            self.drive_roots[row] = (root, filesystem)
-        if not self.source_text.get() and self.mode.get() == "live_ntfs":
-            for row, (root, filesystem) in self.drive_roots.items():
-                if filesystem.upper() == "NTFS":
-                    self.drive_list.selection_set(row)
-                    self.source_text.set(root)
-                    break
+    def pick_mode(self, mode):
+        self.mode.set(mode)
+        self.change_source_mode()
 
-    def select_drive(self, _event=None):
-        selection = self.drive_list.selection()
-        if self.mode.get() in ("live_ntfs", "formatted") and selection and selection[0] in self.drive_roots:
-            self.source_text.set(self.drive_roots[selection[0]][0])
+    def shortcut(self, kind):
+        if kind == "Bin":
+            self.pick_mode("bin")
+        elif kind == "Image":
+            self.pick_mode("ntfs_image")
+            self.choose_source()
+        elif kind == "Desktop":
+            self.pick_mode("live_ntfs")
+            folder = ctypes.create_unicode_buffer(260)
+            if ctypes.windll.shell32.SHGetFolderPathW(None, 0x10, None, 0, folder) == 0:
+                self.source_text.set(folder.value)
+            self.focus_path()
+        else:
+            self.pick_mode("live_ntfs")
+            self.focus_path()
+            self.choose_source()
+
+    def toggle_options(self):
+        self.options_open = not self.options_open
+        self.layout_locations()
+
+    def refresh_drives(self):
+        self.drive_roots.clear()
+        self.volume_names.clear()
+        self.cards.clear()
+        for child in self.drives_box.winfo_children():
+            child.destroy()
+        groups = {}
+        for root, name, filesystem in local_volumes() if self.can_scan_drives else ():
+            self.drive_roots[root] = (root, filesystem)
+            self.volume_names[root] = name
+            group = "Removable drives" if ctypes.windll.kernel32.GetDriveTypeW(root) == 2 else "Local drives"
+            groups.setdefault(group, []).append(root)
+        for group in ("Removable drives", "Local drives"):
+            roots = groups.get(group, [])
+            if not roots:
+                continue
+            tk.Label(self.drives_box, text=f"{group} ({len(roots)})", bg=BG, fg=MUTED).pack(anchor="w", pady=(4,8))
+            grid = tk.Frame(self.drives_box, bg=BG)
+            grid.pack(fill="x", pady=(0,12))
+            for i, root in enumerate(roots):
+                card = tk.Canvas(grid, width=214, height=80, bg=BG, highlightthickness=0, takefocus=True, cursor="hand2")
+                card.grid(row=i//2, column=i%2, sticky="w", padx=(0,8), pady=3)
+                self.cards[root] = card
+                card.create_rectangle(1,1,213,79, outline=BG, fill=BG, tags="surface")
+                card.create_image(12,40, anchor="w", image=self.location_icons["Drive",48])
+                card.create_text(69,23, anchor="w", text=f"{self.volume_names[root][:15]} ({root[:2]})",
+                                 fill=TEXT, font=("Segoe UI Semibold",10))
+                try:
+                    space = shutil.disk_usage(root)
+                except OSError:
+                    space = None
+                if space and space.total:
+                    card.create_rectangle(69,40,195,44,fill="#464c57",outline="")
+                    card.create_rectangle(69,40,69+126*space.used/space.total,44,fill="#54b8db",outline="")
+                    card.create_text(69,58,anchor="w",text=f"{size_label(space.free)} free of {size_label(space.total)}",
+                                     fill=MUTED,font=("Segoe UI",8))
+                card.create_oval(194,5,208,19, fill=ACCENT, outline="",tags="check")
+                card.create_text(201,12,text="✓",fill="white",font=("Segoe UI",8),tags="check")
+                for event in ("<Button-1>", "<Return>", "<space>"):
+                    card.bind(event, lambda _, r=root: self.source_text.set(r))
+                card.bind("<FocusIn>", lambda _, c=card:c.configure(highlightthickness=1,highlightbackground=MUTED,highlightcolor=MUTED))
+                card.bind("<FocusOut>", lambda _, c=card:c.configure(highlightthickness=0))
+        if not groups:
+            tk.Label(self.drives_box, text="No mounted drives found", bg=BG, fg=MUTED).pack(anchor="w")
+        if not self.source_text.get() and self.mode.get() in ("live_ntfs", "formatted"):
+            self.source_text.set(next((r for r, fs in self.drive_roots.values() if fs.upper()=="NTFS"), next(iter(self.drive_roots),"")))
+        self.update_source()
 
     def focus_path(self, _event=None):
         self.tabs.select(self.scan_page)
         if self.mode.get() != "bin":
+            self.options_open = True
+            self.layout_locations()
             self.path_entry.focus_set()
             self.path_entry.selection_range(0, "end")
         return "break"
@@ -412,7 +525,7 @@ class RecoveryWindow(tk.Tk):
             if self.elevated:
                 self.start_scan(False)
             else:
-                self.activity.configure(text="Administrator access was not granted. Scan has not started.")
+                self.source_label.configure(text="Administrator access was not granted. Scan has not started.")
 
     def elevate(self, resume_scan=False):
         if not self.can_scan_drives or self.job is not None or self.saving:
@@ -432,7 +545,7 @@ class RecoveryWindow(tk.Tk):
         run.restype = ctypes.c_void_p
         result = run(None, "runas", str(executable), arguments, str(script.parent), 1)
         if not result or result <= 32:
-            self.activity.configure(text="Administrator access was not granted. Scan has not started.")
+            self.source_label.configure(text="Administrator access was not granted. Scan has not started.")
         else:
             self.close()
 
@@ -620,44 +733,54 @@ class RecoveryWindow(tk.Tk):
         self.log = tk.Text(inspector, height=7, width=28, wrap="word", font=("Consolas", 9), state="disabled",
                            bg=PANEL, fg=TEXT, relief="flat")
 
+    def layout_locations(self):
+        mode = self.mode.get()
+        titles = {"live_ntfs":"Select a location to search for lost data", "bin":"Search the Recycle Bin",
+                  "formatted":"Select a formatted drive", "folder":"Select the original folder",
+                  "recover":"Deep scan a disk image", "ntfs_image":"Search a disk image", "inspect":"Inspect disk partitions"}
+        self.location_heading.configure(text=titles[mode])
+        for key, button in self.nav_buttons.items():
+            button.configure(bg="#313e50" if key == mode else DARK, fg="#82b3ff" if key == mode else TEXT)
+        for box in (self.drives_box,self.locations_box,self.path_panel,self.hint_box,self.carve_options,self.options_button):
+            box.pack_forget()
+        if mode in ("live_ntfs", "formatted"):
+            self.drives_box.pack(fill="x")
+        if mode == "live_ntfs":
+            self.locations_box.pack(fill="x", pady=(8,0))
+        if mode != "bin" and (self.options_open or mode not in ("live_ntfs","formatted")):
+            self.path_panel.pack(fill="x", pady=(8,0))
+        self.options_button.configure(text="Hide scan options  ▴" if self.options_open else "Scan options  ▾")
+        self.options_button.pack(anchor="w", pady=(10,0))
+        if self.options_open or mode == "formatted":
+            (self.carve_options if mode == "formatted" else self.hint_box).pack(fill="x", pady=6)
+
     def change_source_mode(self):
         mode = self.mode.get()
-        if mode == "formatted":
-            self.hint_box.pack_forget()
-            self.carve_options.pack(before=self.source_label, fill="x", pady=(0, 10))
-        else:
-            self.carve_options.pack_forget()
-            self.hint_box.pack(before=self.source_label, fill="x", pady=(4, 12))
-        if mode in ("live_ntfs", "formatted"):
-            if not self.drive_panel.winfo_manager():
-                self.drive_panel.pack(before=self.path_panel if self.path_panel.winfo_manager()
-                                      else self.source_label, fill="x", pady=(0, 14))
-        else:
-            self.drive_panel.pack_forget()
-        if mode == "bin":
-            self.path_panel.pack_forget()
-        elif not self.path_panel.winfo_manager():
-            self.path_panel.pack(before=self.source_label, fill="x", pady=(0, 7))
-        self.source_text.set(self.source_paths.get(mode, ""))
-        if not self.source_text.get() and mode in ("live_ntfs", "formatted"):
-            self.select_drive()
-        self.update_source()
+        self.options_open = False
+        self.layout_locations()
+        value = self.source_paths.get(mode, "")
+        if not value and mode in ("live_ntfs", "formatted"):
+            value = next((r for r, fs in self.drive_roots.values() if fs.upper()=="NTFS"), next(iter(self.drive_roots),""))
+        self.source_text.set(value)
 
     def update_source(self):
         mode = self.mode.get()
         value = self.source_text.get().strip()
         self.source_paths[mode] = value
-        self.elevation_button.pack_forget()
+        for root, card in self.cards.items():
+            selected = root.casefold() == value.casefold()
+            card.itemconfigure("surface", fill=SELECT if selected else BG, outline=ACCENT if selected else BG)
+            card.itemconfigure("check", state="normal" if selected else "hidden")
         labels = {"formatted": "Search formatted drive", "live_ntfs": "Scan for deleted files", "bin": "Scan Recycle Bin", "folder": "Scan Recycle Bin",
                   "ntfs_image": "Scan image", "recover": "Deep scan image", "inspect": "Inspect image"}
-        self.start_button.configure(text=labels[mode])
+        self.start_button.configure(text="Search for lost data" if mode == "live_ntfs" else labels[mode])
         self.path_label.configure(text="Drive or folder path" if mode in ("live_ntfs", "folder", "formatted") else "Image file path")
         ready = bool(value) or mode == "bin"
         if mode == "live_ntfs":
             if not self.elevated:
                 text = "Administrator access is required to read the drive."
                 if self.can_scan_drives:
-                    self.elevation_button.pack(side="right", padx=(0, 8))
+                    text = "Windows will ask for administrator access when you start."
             else:
                 text = "Save recovered files to a different physical disk."
             if value:
@@ -1728,7 +1851,7 @@ class RecoveryWindow(tk.Tk):
                 space = shutil.disk_usage(root)
             except OSError:
                 continue
-            label = self.drive_list.set(row, "volume")
+            label = self.volume_names[row]
             drives.insert("", "end", iid=row, text=f"{label} ({root})", image=self.icons["Folder"],
                           values=(f"{size_label(space.free)} free",))
         def select_drive(_event):
