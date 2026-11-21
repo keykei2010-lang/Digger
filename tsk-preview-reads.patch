@@ -1,0 +1,58 @@
+--- a/tools/fstools/icat.cpp
++++ b/tools/fstools/icat.cpp
+@@ -26,0 +27,35 @@
++#ifdef TSK_WIN32
++#include <fcntl.h>
++#include <io.h>
++#endif
++
++// Serve bounded reads for the media decoder without creating a recovered file.
++static int read_file_ranges(TSK_FS_INFO *fs, TSK_INUM_T inum, TSK_FS_ATTR_TYPE_ENUM type, uint16_t id)
++{
++#ifdef TSK_WIN32
++    if (_setmode(_fileno(stdout), _O_BINARY) == -1) return 1;
++#endif
++    TSK_FS_FILE *file = tsk_fs_file_open_meta(fs, NULL, inum);
++    if (!file) return 1;
++    const TSK_FS_ATTR *attr = tsk_fs_file_attr_get_type(file, type, id, 1);
++    char request[96];
++    char buffer[512 * 1024];
++    int result = attr ? 0 : 1;
++    while (!result && fgets(request, sizeof(request), stdin)) {
++        unsigned long long offset, length;
++        if (sscanf(request, "%llu %llu", &offset, &length) != 2 || !length ||
++                length > sizeof(buffer) || offset > (unsigned long long)attr->size ||
++                length > (unsigned long long)attr->size - offset) {
++            result = 1;
++            break;
++        }
++        ssize_t read = tsk_fs_attr_read(attr, (TSK_OFF_T)offset, buffer, (size_t)length,
++                                        TSK_FS_FILE_READ_FLAG_NONE);
++        if (read != (ssize_t)length || fwrite(buffer, 1, (size_t)length, stdout) != length || fflush(stdout)) {
++            result = 1;
++            break;
++        }
++    }
++    tsk_fs_file_close(file);
++    return result;
++}
+@@ -80,0 +116 @@
++    bool range_mode = false;
+@@ -105 +141 @@
+-    while ((ch = GETOPT(argc, argv, _TSK_T("b:f:hi:o:rRsvVP:B:k:S:"))) > 0) {
++    while ((ch = GETOPT(argc, argv, _TSK_T("Jb:f:hi:o:rRsvVP:B:k:S:"))) > 0) {
+@@ -182,0 +219,3 @@
++        case _TSK_T('J'):
++            range_mode = true;
++            break;
+@@ -278,3 +317,7 @@
+-    retval =
+-        tsk_fs_icat(fs, inum, type, type_used, id, id_used,
+-        (TSK_FS_FILE_WALK_FLAG_ENUM) fw_flags);
++    if (range_mode) {
++        retval = !TSK_FS_TYPE_ISNTFS(fs->ftype) || !type_used || !id_used ||
++            read_file_ranges(fs, inum, type, id);
++    } else {
++        retval = tsk_fs_icat(fs, inum, type, type_used, id, id_used,
++            (TSK_FS_FILE_WALK_FLAG_ENUM) fw_flags);
++    }

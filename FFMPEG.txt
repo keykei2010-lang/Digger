@@ -1,8 +1,17 @@
-FFmpeg 7.1 for Windows x86-64 is shipped as a separate executable for
-generating video thumbnails. It comes from the imageio-ffmpeg 0.6.0 wheel.
+Video previews in the portable Windows build use FFmpeg through the
+PyAV 16.1.0 Windows x64 wheel for CPython 3.13. The bundled DLLs come from
+that wheel. The wheel includes FFmpeg built with GPL components, including
+x264 and x265. See the wheel build recipes for dependency sources.
 
-Package: https://pypi.org/project/imageio-ffmpeg/0.6.0/
-Build recipes: https://github.com/imageio/imageio-binaries
-FFmpeg source: https://ffmpeg.org/releases/ffmpeg-7.1.tar.xz
-FFmpeg license information: https://ffmpeg.org/legal.html
-GNU GPL v3 text: https://www.gnu.org/licenses/gpl-3.0.txt
+PyAV package and source distribution
+https://pypi.org/project/av/16.1.0/
+
+PyAV source and wheel build recipes
+https://github.com/PyAV-Org/PyAV/tree/v16.1.0
+
+FFmpeg source and license information
+https://ffmpeg.org/releases/ffmpeg-8.0.1.tar.xz
+https://ffmpeg.org/legal.html
+
+GNU GPL license text
+https://www.gnu.org/licenses/gpl-3.0.txt

@@ -1,13 +1,14 @@
 """Indexed, read-only undelete using the bundled Sleuth Kit command-line tools."""
+from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import lru_cache
-from io import BytesIO
+from io import BufferedReader, BytesIO, RawIOBase
 import os
 from pathlib import Path, PureWindowsPath
 import re
 import subprocess
 from tempfile import TemporaryFile
-from threading import Thread
+from threading import Thread, Timer
 from recovery_output import atomic_output
 from server import LOCK
 
@@ -31,7 +32,8 @@ class Candidate:
 
 def tool(name, arguments, **kwargs):
     executable = TOOLS / (name + ".exe") if os.name == "nt" else name
-    return subprocess.Popen([str(executable), *arguments], stdin=subprocess.DEVNULL,
+    kwargs.setdefault("stdin", subprocess.DEVNULL)
+    return subprocess.Popen([str(executable), *arguments],
                             creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
                             **kwargs)
 
@@ -353,6 +355,82 @@ def stream_recovery(entry, target):
     else:
         check_identity(entry)
     return evidence
+
+
+class NtfsPreviewReader(RawIOBase):
+    def __init__(self, process, size, budget):
+        super().__init__()
+        self.process = process
+        self.size = size
+        self.budget = budget
+        self.position = 0
+
+    def readable(self):
+        return True
+
+    def seekable(self):
+        return True
+
+    def tell(self):
+        return self.position
+
+    def seek(self, offset, whence=os.SEEK_SET):
+        position = {os.SEEK_SET: 0, os.SEEK_CUR: self.position, os.SEEK_END: self.size}[whence] + offset
+        if position < 0:
+            raise OSError("Invalid media seek.")
+        self.position = position
+        return position
+
+    def readinto(self, buffer):
+        length = min(len(buffer), max(0, self.size - self.position), 512 * 1024)
+        if length == 0:
+            return 0
+        if length > self.budget:
+            raise OSError("Preview read limit reached. Recover the file to open it.")
+        try:
+            self.process.stdin.write(f"{self.position} {length}\n".encode("ascii"))
+            self.process.stdin.flush()
+            contents = self.process.stdout.read(length)
+        except BrokenPipeError as exc:
+            raise OSError("The NTFS reader could not read the preview data.") from exc
+        if len(contents) != length:
+            raise OSError("The NTFS reader could not read the preview data.")
+        buffer[:length] = contents
+        self.position += length
+        self.budget -= length
+        return length
+
+
+@contextmanager
+def seekable_preview(entry, budget):
+    if os.name != "nt" or entry.filesystem != "ntfs":
+        with preview_bytes(entry, budget) as view:
+            yield view
+        return
+    before, _ = recovery_evidence(entry)
+    arguments = ["-J", "-i", "raw", "-f", "ntfs", "-o", str(entry.offset), entry.source, entry.inode]
+    with tool("icat", arguments, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as process:
+        def stop_reader():
+            try:
+                if process.poll() is None:
+                    process.kill()
+            except OSError:
+                pass
+        timeout = Timer(18, stop_reader)
+        timeout.daemon = True
+        timeout.start()
+        try:
+            with BufferedReader(NtfsPreviewReader(process, entry.st_size, budget), 256 * 1024) as view:
+                yield view
+        finally:
+            timeout.cancel()
+            stop_reader()
+    if entry.identity is None:
+        after, _ = recovery_evidence(entry)
+        if before != after:
+            raise OSError("The NTFS record changed during preview. Scan the drive again.")
+    else:
+        check_identity(entry)
 
 
 def preview_bytes(entry, limit):

@@ -11,6 +11,7 @@ Windows-volume use, with optional image-format dependencies disabled:
   patch -p1 < tsk-windows-volume-length.patch
   patch -p1 < tsk-live-scan.patch
   patch -p1 < tsk-ntfs-record.patch
+  patch -p1 < tsk-preview-reads.patch
   ./configure --host=x86_64-w64-mingw32 --disable-java --disable-cppunit \
     --enable-offline --disable-shared LDFLAGS="-static"
   make
