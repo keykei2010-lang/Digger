@@ -5,6 +5,7 @@ import hashlib
 import lzma
 from collections import Counter, deque
 import ctypes
+from ctypes import wintypes
 import os
 import queue
 import re
@@ -1957,37 +1958,61 @@ class RecoveryWindow(tk.Tk):
         except OSError as exc:
             messagebox.showerror("Save scan report", str(exc))
 
-    def modal(self, title, width, height):
-        # The shade covers only Digger's client area.
-        shade = tk.Toplevel(self)
-        shade.withdraw()
-        shade.overrideredirect(True)
-        shade.transient(self)
-        shade.configure(bg="black")
-        shade.attributes("-alpha", .48)
-        shade.geometry(f"{self.winfo_width()}x{self.winfo_height()}+{self.winfo_rootx()}+{self.winfo_rooty()}")
-        shade.deiconify()
-        dialog = tk.Toplevel(shade)
+    def modal(self, title):
+        dialog = tk.Toplevel(self)
         dialog.withdraw()
         dialog.title(title)
-        dialog.transient(shade)
-        dialog.overrideredirect(True)
-        dialog.configure(bg="#353940", highlightbackground="#4a505b", highlightthickness=1)
-        x = self.winfo_rootx() + max(0, (self.winfo_width()-width)//2)
-        y = self.winfo_rooty() + max(0, (self.winfo_height()-height)//2)
+        dialog.transient(self)
+        dialog.configure(bg="#353940")
+        dialog.resizable(False, False)
+        dialog.bind("<Escape>", lambda _: dialog.destroy())
+        return dialog
+
+    def wait_for_modal(self, dialog, width, height, focus):
+        self.update_idletasks()
+        left, top, right, bottom = self.monitor_work_area()
+        width = min(width, right - left - 24)
+        height = min(height, bottom - top - 56)
+        owner_x, owner_y = self.winfo_rootx(), self.winfo_rooty()
+        center_x = owner_x + self.winfo_width() // 2
+        center_y = owner_y + self.winfo_height() // 2
+        x = max(left + 12, min(center_x - width // 2, right - width - 12))
+        y = max(top + 8, min(center_y - height // 2, bottom - height - 48))
         dialog.geometry(f"{width}x{height}+{x}+{y}")
         dialog.deiconify()
+        dialog.wait_visibility()
         dialog.lift()
         dialog.grab_set()
-        dialog.focus_set()
-        dialog.bind("<Escape>", lambda _: shade.destroy())
-        dialog.protocol("WM_DELETE_WINDOW", shade.destroy)
-        tk.Button(dialog, text="×", command=shade.destroy, relief="flat", borderwidth=0,
-                  bg="#353940", fg=TEXT, font=("Segoe UI", 15)).place(relx=1, x=-10, y=6, anchor="ne")
-        return shade, dialog
+        focus.focus_force()
+        self.wait_window(dialog)
+
+    def monitor_work_area(self):
+        if os.name == "nt":
+            class MonitorInfo(ctypes.Structure):
+                _fields_ = [("size", wintypes.DWORD), ("monitor", wintypes.RECT),
+                            ("work", wintypes.RECT), ("flags", wintypes.DWORD)]
+
+            user = ctypes.windll.user32
+            user.MonitorFromWindow.argtypes = (wintypes.HWND, wintypes.DWORD)
+            user.MonitorFromWindow.restype = wintypes.HANDLE
+            user.GetMonitorInfoW.argtypes = (wintypes.HANDLE, ctypes.POINTER(MonitorInfo))
+            monitor = user.MonitorFromWindow(self.winfo_id(), 2)
+            info = MonitorInfo()
+            info.size = ctypes.sizeof(info)
+            if monitor and user.GetMonitorInfoW(monitor, ctypes.byref(info)):
+                area = info.work
+                return area.left, area.top, area.right, area.bottom
+        return 0, 0, self.winfo_screenwidth(), self.winfo_screenheight()
 
     def partition_notice(self, groups):
-        shade, dialog = self.modal("Partitions found", 452, 300)
+        active = self.grab_current()
+        if active is not None:
+            def show_after_close(event):
+                if event.widget == active:
+                    self.after_idle(self.partition_notice, groups)
+            active.bind("<Destroy>", show_after_close, add="+")
+            return
+        dialog = self.modal("Partitions found")
         tk.Label(dialog, text="Partitions with deleted files found", bg="#353940", fg=TEXT,
                  font=("Segoe UI Semibold", 13)).pack(pady=(30, 6))
         tk.Label(dialog, text="Choose a folder in the Path view to explore the recovered names.",
@@ -1998,12 +2023,12 @@ class RecoveryWindow(tk.Tk):
             node = tree.insert("", "end", text=f"{fs.upper()} partition at sector {sector:,}",
                                image=self.icons["Folder"], open=True)
             tree.insert(node, "end", text=f"{count:,} deleted files")
-        ttk.Button(dialog, text="Got it", style="Digger.TButton", command=shade.destroy).pack(pady=(0, 16))
-        self.wait_window(shade)
+        close = ttk.Button(dialog, text="Got it", style="Digger.TButton", command=dialog.destroy)
+        close.pack(pady=(0, 16))
+        self.wait_for_modal(dialog, 452, 300, close)
 
     def choose_recovery_folder(self, subtitle):
-        self.update_idletasks()
-        shade, dialog = self.modal("Recovery destination", 562, min(576, self.winfo_height()-30))
+        dialog = self.modal("Recovery destination")
         color = "#353940"
         icon = tk.Canvas(dialog, width=60, height=60, bg=color, highlightthickness=0)
         icon.pack(pady=(28, 6))
@@ -2021,10 +2046,15 @@ class RecoveryWindow(tk.Tk):
         panel.pack(fill="both", expand=True, padx=24)
         tk.Label(panel, text="Local", bg="#424750", fg=TEXT, pady=5).pack(fill="x", pady=(0, 6))
         choice = tk.StringVar(dialog)
-        drives = ttk.Treeview(panel, columns=("space",), show="tree", height=3, selectmode="browse")
-        drives.column("#0", width=270)
-        drives.column("space", width=140, anchor="e")
-        drives.pack(fill="both", expand=True)
+        drive_list = ttk.Frame(panel)
+        drive_list.pack(fill="both", expand=True)
+        drives = ttk.Treeview(drive_list, columns=("space",), show="tree", height=3, selectmode="browse")
+        drives.column("#0", width=270, minwidth=105)
+        drives.column("space", width=140, minwidth=100, anchor="e")
+        drives.pack(side="left", fill="both", expand=True)
+        scrollbar = ttk.Scrollbar(drive_list, orient="vertical", command=drives.yview)
+        scrollbar.pack(side="right", fill="y")
+        drives.configure(yscrollcommand=scrollbar.set)
         for row, (root, _) in self.drive_roots.items():
             try:
                 space = shutil.disk_usage(root)
@@ -2042,11 +2072,17 @@ class RecoveryWindow(tk.Tk):
         field.pack(fill="x", pady=(6, 0))
         def browse():
             folder = filedialog.askdirectory(parent=dialog, title="Choose recovery folder")
+            dialog.lift()
             if folder:
                 drives.selection_remove(*drives.selection())
                 choice.set(folder)
-        ttk.Button(field, text="Choose folder…", command=browse).pack(side="left", padx=(0, 6))
-        ttk.Entry(field, textvariable=choice).pack(side="left", fill="x", expand=True)
+                save.focus_set()
+            else:
+                browse_button.focus_set()
+        browse_button = ttk.Button(field, text="Choose folder…", command=browse)
+        browse_button.pack(side="left", padx=(0, 6))
+        entry = ttk.Entry(field, textvariable=choice)
+        entry.pack(side="left", fill="x", expand=True)
         result = []
         def accept():
             path = Path(choice.get())
@@ -2054,10 +2090,13 @@ class RecoveryWindow(tk.Tk):
                 messagebox.showerror("Recovery destination", "Choose an existing folder.", parent=dialog)
                 return
             result.append(choice.get())
-            shade.destroy()
-        ttk.Button(footer, text="Save", width=12, style="Digger.TButton", command=accept).pack(side="right")
-        dialog.bind("<Return>", lambda _: accept())
-        self.wait_window(shade)
+            dialog.destroy()
+        ttk.Button(footer, text="Cancel", command=dialog.destroy).pack(side="left")
+        save = ttk.Button(footer, text="Save", width=12, style="Digger.TButton", command=accept, state="disabled")
+        save.pack(side="right")
+        choice.trace_add("write", lambda *_: save.configure(state="normal" if choice.get().strip() else "disabled"))
+        dialog.bind("<Return>", lambda _: save.invoke())
+        self.wait_for_modal(dialog, 562, 576, drives if drives.get_children() else browse_button)
         return result[0] if result else ""
 
     def save_selected(self):
@@ -2077,7 +2116,7 @@ class RecoveryWindow(tk.Tk):
                 raise OSError(f"Selected files need {size_label(required)}, and the destination has {size_label(available)} free.")
             destination = Path(tempfile.mkdtemp(prefix="Digger-Recovered-", dir=folder))
         except OSError as exc:
-            messagebox.showerror("Recover selected files", str(exc))
+            messagebox.showerror("Recover selected files", str(exc), parent=self)
             return
         self.saving = True
         self.save_status.configure(text="Recovering selected files…")
