@@ -15,6 +15,9 @@ class CarvedResults:
         self.root = None
         self.seen = set()
         self.source_size = 0
+        self.report_closed = False
+        self.count = 0
+        self.last_offset = 0
 
     def read(self):
         if self.parser is None:
@@ -30,6 +33,8 @@ class CarvedResults:
                             self.root = node
                         if event == "end" and node.tag == "image_size" and (node.text or "").isdecimal():
                             self.source_size = int(node.text)
+                        if event == "end" and node is self.root:
+                            self.report_closed = True
                         if event == "end" and node.tag == "fileobject":
                             self.add(node)
                             try:
@@ -57,10 +62,27 @@ class CarvedResults:
                 or not re.fullmatch(r"files\.\d+", path.parent.name)
                 or path in self.seen or not path.is_file() or path.stat().st_size != int(size)):
             return
+        offsets = [int(value) for run in node.findall("byte_runs/byte_run")
+                   if (value := run.get("img_offset", "")).isdecimal()]
+        if offsets:
+            self.last_offset = max(self.last_offset, max(offsets))
+            self.job["last_sector_match"] = self.last_offset
         self.register(path)
+
+    def verified_completion(self):
+        try:
+            with (self.job["folder"] / "photorec.log").open("rb") as stream:
+                stream.seek(max(0, (self.job["folder"] / "photorec.log").stat().st_size - 65536))
+                log = stream.read()
+        except OSError:
+            return False
+        return (self.report_closed and self.source_size > 0
+                and not (self.job["folder"] / "photorec.ses").exists()
+                and re.search(rb"(?m)^Total: [0-9]+ files? found\r?$", log) is not None)
 
     def register(self, path):
         self.seen.add(path)
         corrected = correct_extension(path)
         self.seen.add(corrected)
         self.job["matches"].append((corrected, None))
+        self.count += 1

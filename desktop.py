@@ -396,6 +396,7 @@ class RecoveryWindow(tk.Tk):
         self.name_hint = tk.StringVar()
         self.movie_filter = tk.StringVar(value="All file types")
         self.scan_area = tk.StringVar(value="Whole volume")
+        self.scan_depth = tk.StringVar(value="Quick + deep")
         self.raw_source = None
         self.output_folder = None
         self.page_number = 0
@@ -582,7 +583,7 @@ class RecoveryWindow(tk.Tk):
         self.nav_buttons = {}
         sidebar = (("Data recovery", (("live_ntfs", "Hardware disk", "Drive"), ("bin", "Recycle Bin", "Bin"),
                                      ("ntfs_image", "Disk image", "Image"))),
-                   ("Advanced recovery", (("formatted", "Formatted drive", "Drive"), ("recover", "Deep scan image", "Image"),
+                   ("Advanced recovery", (("formatted", "Deep scan drive", "Drive"), ("recover", "Deep scan image", "Image"),
                                           ("inspect", "Inspect partitions", "Image"), ("folder", "Bin by folder", "Folder"))))
         self.location_icons = {(kind, size): location_icon(kind, size) for kind in
                                ("Drive", "Bin", "Desktop", "Folder", "Image") for size in (21, 48)}
@@ -650,6 +651,12 @@ class RecoveryWindow(tk.Tk):
         self.hint_box = ttk.Frame(content)
         ttk.Label(self.hint_box, text="File name contains").pack(side="left")
         ttk.Entry(self.hint_box, textvariable=self.name_hint, width=26).pack(side="left", padx=8)
+        self.depth_options = ttk.Frame(content)
+        ttk.Label(self.depth_options, text="Search depth").pack(side="left", padx=(0, 8))
+        depth = ttk.Combobox(self.depth_options, state="readonly", textvariable=self.scan_depth,
+                             values=("Quick + deep", "Quick only"), width=18)
+        depth.pack(side="left")
+        depth.bind("<<ComboboxSelected>>", lambda _: self.update_source())
         self.carve_options = ttk.Frame(content)
         ttk.Label(self.carve_options, text="Look for").pack(side="left")
         ttk.Combobox(self.carve_options, state="readonly", textvariable=self.movie_filter,
@@ -802,7 +809,7 @@ class RecoveryWindow(tk.Tk):
         self.mode.set("formatted")
         self.change_source_mode()
         self.source_text.set(drive)
-        self.scan_area.set("Unallocated space only")
+        self.scan_area.set("Whole volume" if self.deep_already_ran else "Unallocated space only")
         self.tabs.select(self.scan_page)
 
     def build_results(self):
@@ -813,7 +820,7 @@ class RecoveryWindow(tk.Tk):
         self.save_status = ttk.Label(heading, foreground=TEXT)
         self.save_status.pack(side="left")
         self.recovery_details_button = ttk.Button(heading, text="Recovery details", command=self.show_recovery_report)
-        self.media_drive_button = ttk.Button(heading, text="Search a drive for missing media…", command=self.choose_media_drive)
+        self.media_drive_button = ttk.Button(heading, text="Deep scan a drive…", command=self.choose_media_drive)
         self.deep_button = ttk.Button(heading, text="Deep scan this drive…", command=self.continue_deep_scan)
         self.open_output = ttk.Button(heading, text="Open recovery folder", state="disabled",
                                       command=lambda: os.startfile(self.output_folder))
@@ -1060,18 +1067,20 @@ class RecoveryWindow(tk.Tk):
     def layout_locations(self):
         mode = self.mode.get()
         titles = {"live_ntfs":"Select a location to search for lost data", "bin":"Search the Recycle Bin",
-                  "formatted":"Select a formatted drive", "folder":"Select the original folder",
+                  "formatted":"Select a drive for deep scan", "folder":"Select the original folder",
                   "recover":"Deep scan a disk image", "ntfs_image":"Search a disk image", "inspect":"Inspect disk partitions"}
         self.location_heading.configure(text=titles[mode])
         for key, button in self.nav_buttons.items():
             button.configure(bg="#313e50" if key == mode else DARK, fg="#82b3ff" if key == mode else TEXT)
-        for box in (self.drives_box,self.locations_box,self.path_panel,self.hint_box,self.carve_options,self.options_button):
+        for box in (self.drives_box,self.locations_box,self.path_panel,self.hint_box,self.depth_options,self.carve_options,self.options_button):
             box.pack_forget()
         if mode in ("live_ntfs", "formatted"):
             self.drives_box.pack(fill="x")
         self.locations_box.pack(fill="x", pady=(8,0))
         if mode != "bin":
             self.path_panel.pack(fill="x", pady=(8,0))
+        if mode == "live_ntfs":
+            self.depth_options.pack(fill="x", pady=(10, 0))
         self.options_button.configure(text="Hide scan options  ▴" if self.options_open else "Scan options  ▾")
         self.options_button.pack(anchor="w", pady=(10,0))
         if self.options_open or mode == "formatted":
@@ -1094,13 +1103,14 @@ class RecoveryWindow(tk.Tk):
             selected = root.casefold() == value.casefold()
             card.itemconfigure("surface", fill=SELECT if selected else PANEL, outline=ACCENT if selected else BORDER)
             card.itemconfigure("check", state="normal" if selected else "hidden")
-        labels = {"formatted": "Search formatted drive", "live_ntfs": "Scan for deleted files", "bin": "Scan Recycle Bin", "folder": "Scan Recycle Bin",
+        labels = {"formatted": "Start deep scan", "live_ntfs": "Scan for deleted files", "bin": "Scan Recycle Bin", "folder": "Scan Recycle Bin",
                   "ntfs_image": "Scan image", "recover": "Deep scan image", "inspect": "Inspect image"}
         self.start_button.configure(text="Search for lost data" if mode == "live_ntfs" else labels[mode])
         self.path_label.configure(text="Drive or folder path" if mode in ("live_ntfs", "folder", "formatted") else "Image file path")
         ready = bool(value) or mode == "bin"
         if mode == "live_ntfs":
-            text = "Save recovered files to a different physical disk."
+            text = ("Search deleted records first, then scan unallocated space on this drive."
+                    if self.scan_depth.get() == "Quick + deep" else "Quick scan reads deleted filesystem records.")
             if value:
                 try:
                     scope = selected_scope(os.path.expandvars(value))
@@ -1162,7 +1172,8 @@ class RecoveryWindow(tk.Tk):
                 if not source.is_file():
                     messagebox.showerror("Scan source", "Choose an existing disk image file.")
                     return
-        only_free = mode == "formatted" and self.scan_area.get() == "Unallocated space only"
+        deep_after_quick = mode == "live_ntfs" and self.scan_depth.get() == "Quick + deep"
+        only_free = deep_after_quick or (mode == "formatted" and self.scan_area.get() == "Unallocated space only")
         if only_free and not any(root.casefold() == source.anchor.casefold() and fs.upper() == "NTFS"
                                  for root, fs in self.drive_roots.values()):
             messagebox.showerror("Scan area", "Unallocated-space scans require a mounted NTFS volume. Choose Whole volume for this source.", parent=self)
@@ -1189,8 +1200,10 @@ class RecoveryWindow(tk.Tk):
                 return
             self.test_folders.append(scratch)
             folder = Path(scratch.name)
-        elif mode == "formatted":
-            destination = self.choose_recovery_folder(f"Scan all of {source.drive} and save discoveries on a different physical disk.")
+        elif mode == "formatted" or deep_after_quick:
+            subtitle = (f"Quick scan checks the selected path. Deep scan searches unallocated space across {source.drive}."
+                        if deep_after_quick else f"Scan {source.drive} for surviving file contents.")
+            destination = self.choose_recovery_folder(subtitle + " Choose another physical disk for the results.")
             if not destination:
                 return
             try:
@@ -1204,8 +1217,9 @@ class RecoveryWindow(tk.Tk):
             folder = Path(tempfile.mkdtemp(dir=RUNS.name))
         self.deep_button.pack_forget()
         self.media_drive_button.pack_forget()
-        self.raw_source = device if mode == "formatted" else None
-        self.output_folder = folder if mode == "formatted" else None
+        has_raw_scan = mode == "formatted" or deep_after_quick
+        self.raw_source = device if has_raw_scan else None
+        self.output_folder = folder if has_raw_scan else None
         if self.output_folder:
             self.open_output.configure(state="normal")
             self.open_output.pack(side="right")
@@ -1213,8 +1227,9 @@ class RecoveryWindow(tk.Tk):
             self.open_output.pack_forget()
         self.job = {"folder": folder, "mode": mode, "status": "preparing", "matches": deque(),
                     "self_test": sample, "started": monotonic(), "source": str(source or ("Recycle Bin" if mode == "bin" else "Built-in NTFS test image"))}
-        if mode == "formatted":
-            self.job.update(device=device, movies_only=self.movie_filter.get() == "MP4 / MOV movies", only_free=only_free)
+        if has_raw_scan:
+            self.job.update(device=device, movies_only=mode == "formatted" and self.movie_filter.get() == "MP4 / MOV movies",
+                            only_free=only_free, deep_after_quick=deep_after_quick, raw_search=mode == "formatted")
         self.scan_source = self.job["source"]
         self.thumbnails.clear()
         self.grid_thumbnails.clear()
@@ -1277,6 +1292,8 @@ class RecoveryWindow(tk.Tk):
                 self.scan_bin(job, source if job["mode"] == "folder" else None)
             elif job["mode"] == "formatted":
                 self.carve(job)
+            elif job.get("deep_after_quick"):
+                self.scan_quick_and_deep(job, source)
             elif job["mode"] in ("live_ntfs", "ntfs_image"):
                 self.scan_indexed(job, source)
             else:
@@ -1326,17 +1343,32 @@ class RecoveryWindow(tk.Tk):
             except OSError:
                 pass
 
+    def scan_quick_and_deep(self, job, source):
+        job["phase"] = "Quick scan · Reading NTFS file records"
+        try:
+            self.scan_indexed(job, source)
+        except OSError as exc:
+            job["quick_warning"] = str(exc)
+        if job["status"] == "stopping":
+            return
+        job["quick_records"] = job.pop("records", None)
+        job["phase"] = "Deep scan · Searching unallocated space for file contents"
+        job["raw_search"] = True
+        self.carve(job)
+
     def carve(self, job):
         carved = CarvedResults(job)
         run_job(job, carved.read)
+        job["sector_matches"] = carved.count
         if job["status"] == "complete":
             job["volume_bytes"] = carved.source_size
-            if job["mode"] == "formatted" and not carved.source_size:
-                raise OSError("PhotoRec did not confirm a readable source volume.")
+            if not carved.verified_completion():
+                raise OSError("PhotoRec exited without a complete scan report. Deep scan coverage is unknown.")
             for path in files_in(job):
                 path = path.resolve()
                 if path not in carved.seen:
                     carved.register(path)
+            job["sector_matches"] = carved.count
 
     def scan_bin(self, job, folder):
         for match in scan_recycle_bin(folder, cancelled=lambda: job["status"] == "stopping"):
@@ -1401,8 +1433,8 @@ class RecoveryWindow(tk.Tk):
             stage = {"formatted": "Searching raw sectors for surviving file contents", "live_ntfs": "Reading NTFS file table", "ntfs_image": "Reading filesystem index",
                      "recover": "Carving disk image", "inspect": "Inspecting partition table",
                      "bin": "Reading Recycle Bin", "folder": "Reading Recycle Bin"}[job["mode"]]
-            if job.get("only_free"):
-                stage = "Searching unallocated space for surviving files"
+            if job.get("raw_search") and job.get("only_free"):
+                stage = "Deep scan · Searching unallocated space for file contents"
             detail = ""
             copying = job.get("copying")
             if copying or records:
@@ -1420,10 +1452,13 @@ class RecoveryWindow(tk.Tk):
                     detail = f"   ·   {done:,} / {total:,} records"
             elif str(self.progress.cget("mode")) == "determinate":
                 self.update_motion()
+            if job.get("last_sector_match"):
+                detail += f"   ·   Last sector match at {size_label(job['last_sector_match'])}"
             stage = job.get("phase", stage)
             if job["status"] == "running":
                 percentage = f"  ·  {min(100, 100 * done // max(1, total))}%" if copying or records else ""
-                self.set_scan_status("Scanning" + percentage, "#91bdff")
+                heading = "Deep scan" if job.get("raw_search") or job["mode"] == "recover" else "Scanning"
+                self.set_scan_status(heading + percentage, "#91bdff")
                 self.ring.itemconfigure(self.ring_text, text=percentage.split()[-1] if percentage else "…")
                 self.ring.itemconfigure(self.ring_arc, extent=-359 * done / max(1, total) if percentage else -75,
                                         start=90 if percentage or not self.animate.get() else -int(monotonic() * 120) % 360)
@@ -1478,7 +1513,7 @@ class RecoveryWindow(tk.Tk):
                 self.checks[key] = "Deleted " + {"ntfs": "NTFS", "fat": "FAT", "exfat": "exFAT"}[path.filesystem] + " record"
             if self.job and self.job["mode"] in ("bin", "folder"):
                 self.checks[key] = "Emptied-bin record" if isinstance(path, Candidate) else "Retained in Recycle Bin"
-            elif self.job and self.job["mode"] == "formatted":
+            elif original is None:
                 self.checks[key] = "Carved from drive"
             added.append(key)
             if self.matches_other_facet(key):
@@ -1525,6 +1560,10 @@ class RecoveryWindow(tk.Tk):
             color, symbol = "#f8cb83", "!"
         if job["status"] == "complete" and job["self_test"]:
             title = "Recovery test passed"
+        elif job["status"] == "complete" and job["mode"] in ("live_ntfs", "ntfs_image") and not job.get("raw_search"):
+            title = "Quick scan complete"
+        elif job["status"] == "complete" and job["mode"] in ("bin", "folder") and not bin_search:
+            title = "Bin scan complete"
         self.ring.itemconfigure(self.ring_text, text=symbol)
         self.ring.itemconfigure(self.ring_arc, extent=-359, outline=color)
         self.set_scan_status(title, color)
@@ -1535,6 +1574,8 @@ class RecoveryWindow(tk.Tk):
             self.media_drive_button.pack(side="right", padx=4)
         if job["mode"] == "live_ntfs":
             self.deep_drive = PureWindowsPath(job["source"]).anchor
+            self.deep_button.configure(text="Search whole volume…" if job.get("raw_search") else "Continue with deep scan…")
+            self.deep_already_ran = bool(job.get("raw_search"))
             self.deep_button.pack(side="right", padx=4)
         self.demo.configure(state="disabled" if self.saving else "normal")
         self.update_source()
@@ -1567,25 +1608,37 @@ class RecoveryWindow(tk.Tk):
         elif job["self_test"]:
             summary = "Recovered Documents\\Important.bin from the test image and verified all 12,032 bytes."
         self.activity.configure(text=summary)
-        if job["mode"] == "formatted" and job["status"] == "complete":
-            area = "Unallocated space" if job.get("only_free") else "Whole volume"
-            self.activity.configure(text=f"{summary}   ·   {area}   ·   Saved to {job['folder']}")
+        if (job.get("raw_search") or job["mode"] == "recover") and job["status"] == "complete":
+            area = "Unallocated space" if job.get("only_free") else "Whole image" if job["mode"] == "recover" else "Whole volume"
+            raw = job["sector_matches"]
+            indexed_count = len(self.files) - raw
+            coverage = f"{indexed_count:,} from file records · {raw:,} from sectors" if job.get("deep_after_quick") else f"{raw:,} from sectors"
+            if job.get("quick_warning"):
+                self.set_log(job["quick_warning"])
+                coverage += " · Quick scan incomplete"
+            elif self.files and not self.match_count:
+                coverage += " · Clear filters to see results"
+            self.activity.configure(text=f"{coverage} · {area} · {size_label(job['volume_bytes'])} volume · {elapsed}")
+            self.set_scan_status("Deep scan complete" if raw else "Deep scan complete · No sector matches", color)
         if job.get("error"):
             messagebox.showerror("Scan", job["error"])
-        if indexed and not self.files and job["status"] == "complete":
-            self.set_scan_status("Scan complete  ·  No deleted records found", color)
+        if indexed and not self.files and job["status"] == "complete" and not job.get("raw_search"):
+            self.set_scan_status("Quick scan complete · No deleted records", color)
             self.set_log("No matching deleted filesystem records survived in the selected source. "
-                         "If you scanned a folder, try the whole drive. Use Formatted drive to search raw sectors when the original records are gone.")
+                         "If you scanned a folder, try the whole drive. Use Deep scan drive to search raw sectors when the original records are gone.")
         if is_bin and not self.files and job["status"] == "complete" and not bin_search:
-            self.set_scan_status("Scan complete  ·  No matching Recycle Bin items", color)
+            self.set_scan_status("Bin scan complete · No matches", color)
+            self.set_log("This scan checked Recycle Bin records. Choose Deep scan a drive to look for surviving file contents.")
         log = job["folder"] / "output.log"
         if log.exists():
             with log.open("rb") as stream:
                 stream.seek(max(0, log.stat().st_size - 16384))
                 text = stream.read().decode(errors="replace")
             clean = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b[()][A-Za-z0-9]|\x1b[=>]|[\x00-\x08\x0b-\x1f]", "", text)
-            if job["mode"] == "inspect" or job["status"] == "failed":
+            if job["mode"] == "inspect":
                 self.set_log(clean.strip())
+            elif job["status"] == "failed" and clean.strip():
+                self.set_log(job.get("error", "") + "\n\n" + clean.strip())
 
         if job["mode"] == "ntfs_image" and job["status"] == "complete":
             groups = Counter((entry.offset, entry.filesystem) for entry in self.files.values()

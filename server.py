@@ -56,13 +56,15 @@ def run_job(job, on_progress=None):
     folder = job["folder"]
     commands = {
         "inspect": [str(engine_path("testdisk")), "/list", "source.img"],
-        "recover": [str(engine_path("photorec")), "/d", "files",
+        "recover": [str(engine_path("photorec")), "/log", "/d", "files",
                     "/cmd", "source.img", "partition_none,wholespace,search"],
     }
-    if job["mode"] == "formatted":
+    mode = job["mode"]
+    if mode == "formatted" or job.get("raw_search"):
+        mode = "formatted"
         signatures = "fileopt,everything,disable,mov,enable," if job["movies_only"] else ""
         scan_area = "freespace" if job.get("only_free") else "wholespace"
-        commands["formatted"] = [str(engine_path("photorec")), "/d", "files", "/cmd", job["device"],
+        commands["formatted"] = [str(engine_path("photorec")), "/log", "/d", "files", "/cmd", job["device"],
                                  f"partition_none,{signatures}{scan_area},search"]
     try:
         env = {**os.environ, "TERM": "xterm", "LC_ALL": "C"}
@@ -71,7 +73,7 @@ def run_job(job, on_progress=None):
             shutil.copyfile(ENGINES / "63" / "cygwin", folder / "63" / "cygwin")
             env.update(TERM="cygwin", TERMINFO=".")
         with (folder / "output.log").open("wb") as log:
-            process = subprocess.Popen(commands[job["mode"]], cwd=folder, stdin=subprocess.DEVNULL,
+            process = subprocess.Popen(commands[mode], cwd=folder, stdin=subprocess.DEVNULL,
                                        stdout=log, stderr=subprocess.STDOUT,
                                        env=env, creationflags=subprocess.CREATE_NO_WINDOW if WINDOWS else 0)
             with LOCK:
