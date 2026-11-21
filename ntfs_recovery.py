@@ -6,6 +6,7 @@ import os
 from pathlib import Path, PureWindowsPath
 import re
 import subprocess
+from tempfile import TemporaryFile
 from threading import Thread
 from recovery_output import atomic_output
 from server import LOCK
@@ -180,14 +181,17 @@ def check_identity(entry):
 def ntfs_record(entry):
     arguments = ["-r", "-i", "raw", "-f", "ntfs", "-o", str(entry.offset),
                  entry.source, entry.inode.split("-")[0]]
-    with tool("istat", arguments, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as process:
+    with tool("istat", arguments, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process:
         try:
-            output, _ = process.communicate(timeout=20)
+            output, errors = process.communicate(timeout=20)
         except subprocess.TimeoutExpired:
             process.kill()
             raise OSError("Timed out checking the deleted NTFS record.") from None
-    if process.returncode or b"Not Allocated File" not in output.splitlines():
-        raise OSError("The deleted record is no longer available. Scan the drive again.")
+    if process.returncode:
+        detail = errors[:2048].decode("utf-8", "replace").strip()
+        raise OSError("The NTFS engine could not read the deleted record." + (f" {detail}" if detail else ""))
+    if b"Not Allocated File" not in output.splitlines():
+        raise OSError("The NTFS record is now allocated. Scan the drive again.")
     virtual_name = ("$OrphanFiles" in entry.original.parts and
                     entry.original.name == f"OrphanFile-{entry.inode.split('-')[0]}")
     if not virtual_name and not any(
@@ -275,7 +279,7 @@ def ensure_current(entry):
 def stream_recovery(entry, target):
     before, evidence = recovery_evidence(entry)
     arguments = ["-r", "-i", "raw", "-f", entry.filesystem, "-o", str(entry.offset), entry.source, entry.inode]
-    with tool("icat", arguments, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as process:
+    with TemporaryFile() as errors, tool("icat", arguments, stdout=subprocess.PIPE, stderr=errors) as process:
         remaining = entry.st_size
         try:
             for chunk in iter(lambda: process.stdout.read(1024 * 1024), b""):
@@ -283,8 +287,12 @@ def stream_recovery(entry, target):
                     raise OSError("The recovered data exceeded the expected size.")
                 target.write(chunk)
                 remaining -= len(chunk)
-            if process.wait() or remaining:
-                raise OSError("The engine could not read all bytes for this file.")
+            result = process.wait()
+            if result or remaining:
+                errors.seek(0)
+                detail = errors.read(2048).decode("utf-8", "replace").strip()
+                summary = f"The engine read {entry.st_size - remaining:,} of {entry.st_size:,} expected bytes."
+                raise OSError(summary + (f" {detail}" if detail else f" Engine exit code: {result}."))
         finally:
             if process.poll() is None:
                 process.kill()
