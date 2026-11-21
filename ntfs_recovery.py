@@ -167,7 +167,7 @@ def scan(source, scope, job, include_bin_metadata=False):
             "Some partitions could not be read and were skipped.\n" + next(m for m in messages if m))
     elif not readable:
         detail = next((message for message in messages if message), "")
-        hint = ("The selected volume must be NTFS and the app must run as administrator."
+        hint = ("The NTFS reader could not finish reading the selected volume."
                 if scope is not None else "Choose a raw disk or volume image containing NTFS, FAT, or exFAT.")
         raise OSError("The filesystem scan did not finish. " + hint + ("\n" + detail if detail else ""))
 

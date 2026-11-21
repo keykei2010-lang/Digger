@@ -24,7 +24,8 @@ from PIL import Image, ImageDraw, ImageTk
 from carved_results import CarvedResults
 from recovery_output import atomic_output, output_name
 from ntfs_recovery import Candidate, extract as extract_ntfs, preview_bytes, scan as scan_ntfs
-from windows_volumes import is_elevated, local_volumes, require_separate_disk, selected_scope, source_volume
+from windows_volumes import (check_volume_read_access, is_elevated, local_volumes,
+                             require_separate_disk, selected_scope, source_volume)
 
 from media_preview import IMAGE_TYPES, VIDEO_TYPES, decode_preview
 from recycle_bin import current_user_bins, emptied_items, ordinary, scan_recycle_bin
@@ -528,8 +529,7 @@ class RecoveryWindow(tk.Tk):
         self.name_hint.set(options.name)
         self.movie_filter.set("MP4 / MOV movies" if options.movies else "All file types")
 
-    def show_admin_warning(self, title="Administrator access required",
-                           text="To start this scan, right-click Digger.exe and choose Run as administrator."):
+    def show_admin_warning(self, title, text):
         if self.admin_warning is not None and self.admin_warning.winfo_exists():
             self.admin_warning.destroy()
         panel = self.admin_warning = tk.Frame(self, bg=SURFACE, padx=14, pady=10,
@@ -783,12 +783,7 @@ class RecoveryWindow(tk.Tk):
         self.path_label.configure(text="Drive or folder path" if mode in ("live_ntfs", "folder", "formatted") else "Image file path")
         ready = bool(value) or mode == "bin"
         if mode == "live_ntfs":
-            if not self.elevated:
-                text = "Administrator access is required to read the drive."
-                if self.can_scan_drives:
-                    text = "Start Digger as administrator to scan this drive."
-            else:
-                text = "Save recovered files to a different physical disk."
+            text = "Save recovered files to a different physical disk."
             if value:
                 try:
                     scope = selected_scope(os.path.expandvars(value))
@@ -802,13 +797,14 @@ class RecoveryWindow(tk.Tk):
         elif mode == "formatted":
             text = "Scan the entire mounted volume for file contents. Digger saves discoveries to a different physical disk."
         elif mode == "bin":
-            text = ("List retained items, then search mounted NTFS drives for files removed when the bin was emptied."
-                    if self.elevated or not self.can_scan_drives else
-                    "Lists items still in the Recycle Bin. Run Digger as administrator to also find emptied-bin files.")
+            text = "List retained items and search readable NTFS drives for emptied-bin files."
         elif mode == "folder":
             text = "Find Recycle Bin items originally deleted from this folder."
         else:
             text = "Open a raw disk image such as .img, .dd, or .raw."
+        if self.can_scan_drives and mode in ("bin", "folder", "live_ntfs", "formatted"):
+            launch = {True: "Running as administrator", False: "Standard launch", None: "Launch privileges unknown"}
+            text = f"{launch[self.elevated]} · {text}"
         self.source_label.configure(text=text)
         self.start_button.configure(state="normal" if ready and self.job is None and not self.saving else "disabled")
 
@@ -849,15 +845,17 @@ class RecoveryWindow(tk.Tk):
                 if not source.is_file():
                     messagebox.showerror("Scan source", "Choose an existing disk image file.")
                     return
-        if not sample and mode in ("live_ntfs", "formatted") and not self.elevated:
-            self.show_admin_warning()
-            return
-        limited_bin = not sample and mode in ("bin", "folder") and not self.elevated
-        if limited_bin:
-            # Retained items need no elevation; only the emptied-bin search reads the raw volume.
-            self.show_admin_warning("Emptied-bin search needs administrator access",
-                                    "Showing items still in the Recycle Bin. To also find files removed when the bin "
-                                    "was emptied, right-click Digger.exe and choose Run as administrator.")
+        if mode in ("live_ntfs", "formatted"):
+            try:
+                device = source_volume(source)
+                check_volume_read_access(device)
+            except OSError as exc:
+                if self.needs_admin(exc):
+                    self.show_admin_warning("Windows blocked direct drive access",
+                                            "Right-click the extracted Digger.exe and choose Run as administrator.")
+                else:
+                    messagebox.showerror("Cannot read source drive", str(exc))
+                return
         if sample:
             location = filedialog.askdirectory(title="Choose a healthy drive for the 48 MiB recovery test")
             if not location:
@@ -874,7 +872,6 @@ class RecoveryWindow(tk.Tk):
             if not destination:
                 return
             try:
-                device = source_volume(source)
                 require_separate_disk(device, Path(destination).resolve(strict=True))
                 folder = Path(tempfile.mkdtemp(prefix="Digger-Formatted-", dir=destination))
             except OSError as exc:
@@ -892,7 +889,7 @@ class RecoveryWindow(tk.Tk):
         else:
             self.open_output.pack_forget()
         self.job = {"folder": folder, "mode": mode, "status": "preparing", "matches": deque(),
-                    "self_test": sample, "limited": limited_bin, "started": monotonic(), "source": str(source or ("Recycle Bin" if mode == "bin" else "Built-in NTFS test image"))}
+                    "self_test": sample, "started": monotonic(), "source": str(source or ("Recycle Bin" if mode == "bin" else "Built-in NTFS test image"))}
         if mode == "formatted":
             self.job.update(device=device, movies_only=self.movie_filter.get() == "MP4 / MOV movies")
         self.scan_source = self.job["source"]
@@ -1022,11 +1019,10 @@ class RecoveryWindow(tk.Tk):
             if job["status"] == "stopping":
                 return
             job["matches"].append(match)
-        if job.get("limited"):
-            return
         volumes = {root.casefold() for root, _, fs in local_volumes() if fs.upper() == "NTFS"}
         searched = 0
         failures = []
+        blocked = []
         for bin_path in current_user_bins():
             scope = PureWindowsPath(bin_path)
             if scope.anchor.casefold() not in volumes or (folder and folder.drive.casefold() != scope.drive.casefold()):
@@ -1034,18 +1030,25 @@ class RecoveryWindow(tk.Tk):
             if job["status"] == "stopping":
                 return
             job.pop("records", None)
-            job["phase"] = f"Searching {scope.drive} for emptied-bin records"
+            job["phase"] = f"Opening {scope.drive} for an emptied-bin search"
             try:
+                check_volume_read_access(source_volume(scope))
+                job["phase"] = f"Searching {scope.drive} for emptied-bin records"
                 for match in emptied_items(scope, job, folder):
                     job["matches"].append(match)
                 searched += 1
             except OSError as exc:
-                failures.append(f"{scope.drive} {exc}")
-        if job["status"] != "stopping":
-            if failures:
-                raise OSError("Emptied-bin search incomplete. " + " • ".join(failures))
-            if not searched:
-                raise OSError("No mounted NTFS volumes were available for the emptied-bin search.")
+                if self.needs_admin(exc):
+                    blocked.append(scope.drive)
+                label = f"{scope.drive} · {exc}"
+                failures.append(label)
+        if not searched and not failures:
+            failures.append("No mounted NTFS volumes were available for the emptied-bin search.")
+        if failures:
+            job["bin_search"] = ("partial" if searched else "unavailable", failures, blocked)
+
+    def needs_admin(self, error):
+        return self.elevated is not True and getattr(error, "winerror", None) in (5, 1314)
 
     def scan_indexed(self, job, source):
         scope = source if job["mode"] == "live_ntfs" else None
@@ -1174,9 +1177,15 @@ class RecoveryWindow(tk.Tk):
         labels = {"complete": ("Scan complete", "#92dfa6"), "stopped": ("Scan canceled", "#f8cb83"),
                   "failed": ("Scan failed", "#ffa8a8")}
         title, color = labels[job["status"]]
+        bin_search = job.get("bin_search") if job["status"] == "complete" else None
+        symbol = {"complete": "✓", "failed": "!", "stopped": "■"}[job["status"]]
+        if bin_search:
+            coverage, _, _ = bin_search
+            title = "Emptied-bin search " + coverage
+            color, symbol = "#f8cb83", "!"
         if job["status"] == "complete" and job["self_test"]:
             title = "Recovery test passed"
-        self.ring.itemconfigure(self.ring_text, text={"complete": "✓", "failed": "!", "stopped": "■"}[job["status"]])
+        self.ring.itemconfigure(self.ring_text, text=symbol)
         self.ring.itemconfigure(self.ring_arc, extent=-359, outline=color)
         self.set_scan_status(title, color)
         self.stop_button.pack_forget()
@@ -1205,8 +1214,14 @@ class RecoveryWindow(tk.Tk):
         elif job.get("warnings") and not job.get("error"):
             summary += "   ·   Some partitions were skipped"
             self.set_log("\n\n".join(job["warnings"]))
-        elif job.get("limited") and not job.get("error"):
-            summary += "   ·   Emptied-bin search skipped (needs administrator)"
+        elif bin_search:
+            _, failures, blocked = bin_search
+            summary += "   ·   " + failures[0].splitlines()[0]
+            self.set_log("\n\n".join(failures))
+            if blocked:
+                self.show_admin_warning("Windows blocked direct drive access",
+                                        f"Drive access denied for {', '.join(blocked)}. "
+                                        "Right-click the extracted Digger.exe and choose Run as administrator.")
         elif job.get("error"):
             summary = job["error"].splitlines()[0]
         elif job["self_test"]:
@@ -1220,7 +1235,7 @@ class RecoveryWindow(tk.Tk):
             self.set_scan_status("Scan complete  ·  No deleted records found", color)
             self.set_log("No matching deleted filesystem records survived in the selected source. "
                          "If you scanned a folder, try the whole drive. Use Formatted drive to search raw sectors when the original records are gone.")
-        if is_bin and not self.files and job["status"] == "complete":
+        if is_bin and not self.files and job["status"] == "complete" and not bin_search:
             self.set_scan_status("Scan complete  ·  No matching Recycle Bin items", color)
         log = job["folder"] / "output.log"
         if log.exists():

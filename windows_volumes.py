@@ -72,6 +72,14 @@ def require_separate_disk(source, destination):
         raise OSError("Choose a recovery destination on a different physical disk.")
 
 
+def check_volume_read_access(device):
+    api = kernel()
+    handle = api.CreateFileW(device, 0x80000000, 7, None, 3, 0, None)
+    if handle == ctypes.c_void_p(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    api.CloseHandle(handle)
+
+
 def local_volumes():
     """Return mounted fixed and removable volumes for the source picker."""
     api = kernel()
@@ -110,4 +118,20 @@ def selected_scope(value):
 
 
 def is_elevated():
-    return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    api = kernel()
+    api.GetCurrentProcess.restype = wintypes.HANDLE
+    advapi = ctypes.WinDLL("advapi32", use_last_error=True)
+    advapi.OpenProcessToken.argtypes = (wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE))
+    advapi.GetTokenInformation.argtypes = (wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p,
+                                          wintypes.DWORD, ctypes.POINTER(wintypes.DWORD))
+    token = wintypes.HANDLE()
+    if not advapi.OpenProcessToken(api.GetCurrentProcess(), 0x0008, ctypes.byref(token)):
+        return None
+    try:
+        # TokenElevation describes this process, including when UAC filters an administrator's token.
+        elevated, size = wintypes.DWORD(), wintypes.DWORD()
+        if advapi.GetTokenInformation(token, 20, ctypes.byref(elevated), ctypes.sizeof(elevated), ctypes.byref(size)):
+            return bool(elevated.value)
+        return None
+    finally:
+        api.CloseHandle(token)
