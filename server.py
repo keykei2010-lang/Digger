@@ -61,8 +61,9 @@ def run_job(job, on_progress=None):
     }
     if job["mode"] == "formatted":
         signatures = "fileopt,everything,disable,mov,enable," if job["movies_only"] else ""
+        scan_area = "freespace" if job.get("only_free") else "wholespace"
         commands["formatted"] = [str(engine_path("photorec")), "/d", "files", "/cmd", job["device"],
-                                 "partition_none," + signatures + "wholespace,search"]
+                                 f"partition_none,{signatures}{scan_area},search"]
     try:
         env = {**os.environ, "TERM": "xterm", "LC_ALL": "C"}
         if WINDOWS:

@@ -1,5 +1,7 @@
 """Read PhotoRec's completion records as it closes and validates carved files."""
 from pathlib import Path
+
+from recovered_format import correct_extension
 import re
 from xml.etree.ElementTree import ParseError, XMLPullParser
 
@@ -55,5 +57,10 @@ class CarvedResults:
                 or not re.fullmatch(r"files\.\d+", path.parent.name)
                 or path in self.seen or not path.is_file() or path.stat().st_size != int(size)):
             return
+        self.register(path)
+
+    def register(self, path):
         self.seen.add(path)
-        self.job["matches"].append((path, None))
+        corrected = correct_extension(path)
+        self.seen.add(corrected)
+        self.job["matches"].append((corrected, None))

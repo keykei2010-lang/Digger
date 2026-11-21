@@ -8,7 +8,7 @@ stage=$(mktemp -d)
 trap 'rm -rf "$stage"' EXIT
 root="$stage/Digger"
 mkdir -p "$root"/{runtime/sleuthkit,engines/63,source,licenses}
-cp "$project"/{recovery-check.img.xz,desktop.py,server.py,carved_results.py,media_preview.py,recycle_bin.py,ntfs_recovery.py,windows_volumes.py,recovery_output.py} "$root"
+cp "$project"/{recovery-check.img.xz,desktop.py,server.py,carved_results.py,media_preview.py,recycle_bin.py,ntfs_recovery.py,windows_volumes.py,recovery_output.py,recovered_format.py} "$root"
 cp "$project/WINDOWS.md" "$root/Read me.md"
 cp "$project/launcher-win.c" "$project/tsk-windows-volume-length.patch" "$project/tsk-live-scan.patch" "$project/tsk-ntfs-record.patch" "$project/tsk-preview-reads.patch" "$root/source"
 compiler=${MINGW_CC:-"$inputs/mingw/usr/bin/x86_64-w64-mingw32-gcc-posix"}
