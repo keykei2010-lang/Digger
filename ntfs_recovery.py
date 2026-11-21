@@ -26,6 +26,7 @@ class Candidate:
     st_mtime: int
     identity: tuple | None
     filesystem: str = "ntfs"
+    sequence: int | None = None
 
 
 def tool(name, arguments, **kwargs):
@@ -51,11 +52,13 @@ def body_entry(line, source, offset, volume, fingerprint, filesystem="ntfs"):
     if len(fields) != 10:
         return None
     header, inode, mode, _, _, size, _, modified, _, _ = fields
+    marker, separator, name = header.partition("|/")
+    has_sequence = filesystem == "ntfs" and re.fullmatch(r"seq:[0-9]{1,5}", marker)
     supported_inode = ENTRY_ID.fullmatch(inode) if filesystem == "ntfs" else re.fullmatch(r"[0-9]+", inode)
-    if (not header.startswith("0|/") or not header.endswith(BODY_SUFFIX)
+    if (not separator or (marker != "0" and not has_sequence) or not name.endswith(BODY_SUFFIX)
             or not supported_inode or not mode.startswith(("r/r", "-/r"))):
         return None
-    parts = header[3:-len(BODY_SUFFIX)].split("/")
+    parts = name[:-len(BODY_SUFFIX)].split("/")
     if not all(safe_name(part) for part in parts):
         return None
     try:
@@ -65,7 +68,9 @@ def body_entry(line, source, offset, volume, fingerprint, filesystem="ntfs"):
     if size < 0:
         return None
     prefix = volume + "\\" if volume.endswith(":") else volume
-    return Candidate(source, offset, inode, PureWindowsPath(prefix, *parts), size, modified, fingerprint, filesystem)
+    sequence = int(marker[4:]) if has_sequence else None
+    return Candidate(source, offset, inode, PureWindowsPath(prefix, *parts), size, modified, fingerprint, filesystem,
+                     sequence)
 
 
 def partition_offsets(source, job):
@@ -179,8 +184,10 @@ def check_identity(entry):
 
 
 def ntfs_record(entry):
-    arguments = ["-r", "-i", "raw", "-f", "ntfs", "-o", str(entry.offset),
-                 entry.source, entry.inode.split("-")[0]]
+    inode, _, attribute_id = entry.inode.split("-")
+    structured = os.name == "nt"
+    arguments = ["-J" if structured else "-r", "-i", "raw", "-f", "ntfs", "-o", str(entry.offset),
+                 entry.source, inode]
     with tool("istat", arguments, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process:
         try:
             output, errors = process.communicate(timeout=20)
@@ -190,17 +197,21 @@ def ntfs_record(entry):
     if process.returncode:
         detail = errors[:2048].decode("utf-8", "replace").strip()
         raise OSError("The NTFS engine could not read the deleted record." + (f" {detail}" if detail else ""))
-    if b"Not Allocated File" not in output.splitlines():
-        raise OSError("The NTFS record is now allocated. Scan the drive again.")
     virtual_name = ("$OrphanFiles" in entry.original.parts and
-                    entry.original.name == f"OrphanFile-{entry.inode.split('-')[0]}")
+                    entry.original.name == f"OrphanFile-{inode}")
+    if structured:
+        return read_ntfs_record_status(entry, output, inode, attribute_id, virtual_name)
+    fields = [line.strip() for line in output.splitlines()]
+    if b"Allocated File" in fields or b"Allocated Directory" in fields:
+        raise OSError("NTFS reports this record is in use. Rescan the volume to refresh the results.")
+    if b"Not Allocated File" not in fields:
+        raise OSError("The NTFS reader could not verify this is a deleted file.")
     if not virtual_name and not any(
         line.strip().decode("utf-8", "replace").casefold() == f"name: {entry.original.name}".strip().casefold()
         for line in output.splitlines()
     ):
         raise OSError("The deleted NTFS entry name changed. Scan the drive again.")
-    fields = output.splitlines()
-    attribute = entry.inode.split("-", 1)[1].encode()
+    attribute = f"128-{attribute_id}".encode()
     pattern = rb"^Type: \$DATA \(" + attribute + rb"\).*\bsize:\s*" + str(entry.st_size).encode() + rb"\b"
     index = next((i for i, line in enumerate(fields) if re.search(pattern, line)), None)
     if index is None:
@@ -224,6 +235,45 @@ def ntfs_record(entry):
             return output, "Expected bytes read"
         runs.append((cluster, length))
     return output, runs or "Expected bytes read"
+
+
+def read_ntfs_record_status(entry, output, inode, attribute_id, virtual_name):
+    fields = output.splitlines()
+    header = re.fullmatch(rb"RECORD (\d+) (\d+) (allocated|deleted-file|other|unknown)",
+                          fields[0] if fields else b"")
+    if not header or int(header[1]) != int(inode):
+        raise OSError("The NTFS reader could not verify this file's record status.")
+    sequence = int(header[2])
+    if entry.sequence is not None and sequence != entry.sequence:
+        raise OSError(f"NTFS reused this record after the scan (sequence {entry.sequence} → {sequence}). "
+                      "The current record cannot restore the listed file.")
+    if header[3] == b"allocated":
+        raise OSError("NTFS reports this record is in use. Rescan the volume to refresh the results.")
+    if header[3] != b"deleted-file":
+        raise OSError("The NTFS reader could not verify this is a deleted file.")
+    if not virtual_name and not any(
+        line[5:].decode("utf-8", "replace").casefold() == entry.original.name.casefold()
+        for line in fields if line.startswith(b"NAME ")
+    ):
+        raise OSError("The deleted NTFS entry name changed. Scan the drive again.")
+    attribute = next((line.split() for line in fields if line.startswith(b"DATA ")), ())
+    if len(attribute) != 4 or attribute[1:3] != [attribute_id.encode(), str(entry.st_size).encode()]:
+        raise OSError("The deleted NTFS data attribute changed. Scan the drive again.")
+    if attribute[3] == b"resident":
+        return output, "Resident NTFS data"
+    if attribute[3] == b"unchecked":
+        return output, "Expected bytes read"
+    if attribute[3] == b"runs":
+        runs = []
+        for line in fields:
+            if line.startswith(b"RUN "):
+                run = re.fullmatch(rb"RUN ([1-9]\d*) ([1-9]\d*)", line)
+                if not run:
+                    raise OSError("The NTFS reader returned an invalid data run.")
+                runs.append(tuple(map(int, run.groups())))
+        if runs:
+            return output, runs
+    raise OSError("The NTFS reader could not verify the file's data layout.")
 
 
 def bitmap_prefix(source, offset, limit):

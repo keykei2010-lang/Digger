@@ -1,0 +1,66 @@
+--- a/tools/fstools/istat.cpp
++++ b/tools/fstools/istat.cpp
+@@ -27,0 +28,44 @@
++// Keep allocation state and record identity independent of the human-readable report.
++static int ntfs_record_status(TSK_FS_INFO *fs, TSK_INUM_T inum)
++{
++    TSK_FS_FILE *file = tsk_fs_file_open_meta(fs, NULL, inum);
++    if (!file) return 1;
++    const auto *meta = file->meta;
++    if (!meta) {
++        tsk_fs_file_close(file);
++        return 1;
++    }
++    const char *state = (meta->flags & TSK_FS_META_FLAG_ALLOC) ? "allocated" :
++        (!(meta->flags & TSK_FS_META_FLAG_UNALLOC) ? "unknown" :
++         (meta->type == TSK_FS_META_TYPE_REG ? "deleted-file" : "other"));
++    printf("RECORD %" PRIuINUM " %" PRIu32 " %s\n", meta->addr, meta->seq, state);
++    if (meta->type == TSK_FS_META_TYPE_REG && (meta->flags & TSK_FS_META_FLAG_UNALLOC)) {
++        for (auto *name = meta->name2; name; name = name->next) {
++            if (!strpbrk(name->name, "\r\n")) printf("NAME %s\n", name->name);
++        }
++        const auto *data = tsk_fs_file_attr_get_type(file, TSK_FS_ATTR_TYPE_NTFS_DATA, 0, 0);
++        if (data && !data->name) {
++            const char *storage = "unchecked";
++            if (data->flags & TSK_FS_ATTR_RES) {
++                storage = "resident";
++            } else if ((data->flags & TSK_FS_ATTR_NONRES) && data->nrd.run &&
++                    !(data->flags & (TSK_FS_ATTR_COMP | TSK_FS_ATTR_ENC | TSK_FS_ATTR_SPARSE))) {
++                storage = "runs";
++                for (auto *run = data->nrd.run; run; run = run->next) {
++                    if (run->flags != TSK_FS_ATTR_RUN_FLAG_NONE || !run->addr || !run->len) {
++                        storage = "unchecked";
++                        break;
++                    }
++                }
++            }
++            printf("DATA %u %" PRIdOFF " %s\n", unsigned(data->id), data->size, storage);
++            if (strcmp(storage, "runs") == 0) {
++                for (auto *run = data->nrd.run; run; run = run->next)
++                    printf("RUN %" PRIuDADDR " %" PRIuDADDR "\n", run->addr, run->len);
++            }
++        }
++    }
++    tsk_fs_file_close(file);
++    return 0;
++}
++
+@@ -82,0 +127 @@
++    bool record_status = false;
+@@ -103 +148 @@
+-    while ((ch = GETOPT(argc, argv, _TSK_T("b:N:f:i:o:rs:vVz:P:B:k:S:"))) > 0) {
++    while ((ch = GETOPT(argc, argv, _TSK_T("Jb:N:f:i:o:rs:vVz:P:B:k:S:"))) > 0) {
+@@ -190,0 +236,3 @@
++        case _TSK_T('J'):
++            record_status = true;
++            break;
+@@ -298 +346,8 @@
+-    if (fs->istat(fs, (TSK_FS_ISTAT_FLAG_ENUM) istat_flags, stdout, inum, numblock, sec_skew)) {
++    if (record_status && !TSK_FS_TYPE_ISNTFS(fs->ftype)) {
++        tsk_fprintf(stderr, "The record status option requires NTFS.\n");
++        tsk_fs_close(fs);
++        tsk_img_close(img);
++        exit(1);
++    }
++    if (record_status ? ntfs_record_status(fs, inum) :
++            fs->istat(fs, (TSK_FS_ISTAT_FLAG_ENUM) istat_flags, stdout, inum, numblock, sec_skew)) {
