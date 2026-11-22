@@ -24,6 +24,7 @@ from tkinter import filedialog, messagebox, ttk
 from PIL import Image, ImageDraw, ImageTk
 
 from media_playback import play_sector_video
+from shadow_versions import scan_versions
 from sector_catalog import SectorFile, scan_sectors
 from recovery_output import atomic_output, output_name
 from recovered_format import correct_extension, unique_path
@@ -52,7 +53,7 @@ SELECT = "#34425c"
 SIZE_FILTERS = {"All sizes": 0, "At least 100 KB": 100_000, "At least 1 MB": 1_000_000,
                 "At least 10 MB": 10_000_000, "At least 100 MB": 100_000_000}
 THUMBNAIL_BOUNDS = (288, 208)
-FILE_STATUSES = ("All statuses", "Deleted record", "Still in Recycle Bin", "Raw scan · status unknown")
+FILE_STATUSES = ("All statuses", "Deleted record", "Still in Recycle Bin", "Raw scan · status unknown", "Shadow copy")
 PREFERENCES = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "Digger" / "preferences.json"
 SORTS = ("Discovery order", "Name", "Size", "File date", "Type", "Recoverability")
 GROUPS = ("None", "Original folder", "Type", "File date", "Recoverability")
@@ -443,6 +444,8 @@ class RecoveryWindow(tk.Tk):
         self.last_recovery_report = None
         self.save_events = queue.SimpleQueue()
         self.files = {}
+        self.version_view = False
+        self.snapshot_dates = {}
         self.originals = {}
         self.result_view = tk.StringVar(value="Details")
         self.preview_errors = {}
@@ -622,7 +625,7 @@ class RecoveryWindow(tk.Tk):
         sidebar = (("Data recovery", (("live_ntfs", "Hardware disk", "Drive"), ("bin", "Recycle Bin", "Bin"),
                                      ("ntfs_image", "Disk image", "Image"))),
                    ("Advanced recovery", (("formatted", "Deep Scan", "Drive"), ("recover", "Deep scan image", "Image"),
-                                          ("inspect", "Inspect partitions", "Image"), ("folder", "Bin by folder", "Folder"))))
+                                          ("versions", "Previous versions", "Folder"), ("inspect", "Inspect partitions", "Image"), ("folder", "Bin by folder", "Folder"))))
         self.location_icons = {(kind, size): location_icon(kind, size) for kind in
                                ("Drive", "Bin", "Desktop", "Folder", "Image") for size in (21, 48)}
         for section, items in sidebar:
@@ -1149,7 +1152,7 @@ class RecoveryWindow(tk.Tk):
 
     def layout_locations(self):
         mode = self.mode.get()
-        titles = {"live_ntfs":"Select a location to search for lost data", "bin":"Search the Recycle Bin",
+        titles = {"versions":"Search previous versions", "live_ntfs":"Select a location to search for lost data", "bin":"Search the Recycle Bin",
                   "formatted":"Deep Scan", "folder":"Select the original folder",
                   "recover":"Deep scan a disk image", "ntfs_image":"Search a disk image", "inspect":"Inspect disk partitions"}
         self.location_heading.configure(text=titles[mode])
@@ -1160,7 +1163,7 @@ class RecoveryWindow(tk.Tk):
         if mode in ("live_ntfs", "formatted"):
             self.drives_box.pack(fill="x")
         kinds = (("Image",) if mode in ("ntfs_image", "recover", "inspect") else
-                 ("Desktop", "Folder") if mode == "folder" else ("Bin", "Desktop", "Folder"))
+                 ("Desktop", "Folder") if mode in ("folder", "versions") else ("Bin", "Desktop", "Folder"))
         for kind, (button, _) in self.shortcuts.items():
             if kind in kinds:
                 index = kinds.index(kind)
@@ -1210,10 +1213,10 @@ class RecoveryWindow(tk.Tk):
             button.configure(text=("   ✓   " if selected else "   ") + title,
                              bg=SELECT if selected else PANEL, highlightbackground=ACCENT if selected else BORDER,
                              state="disabled" if name == "Desktop" and not self.desktop_path else "normal")
-        labels = {"formatted": "Start deep scan", "live_ntfs": "Scan for deleted files", "bin": "Scan Recycle Bin", "folder": "Scan Recycle Bin",
+        labels = {"versions": "Search snapshots", "formatted": "Start deep scan", "live_ntfs": "Scan for deleted files", "bin": "Scan Recycle Bin", "folder": "Scan Recycle Bin",
                   "ntfs_image": "Scan image", "recover": "Deep scan image", "inspect": "Inspect image"}
         self.start_button.configure(text="Search for lost data" if mode == "live_ntfs" else labels[mode])
-        self.path_label.configure(text="Drive or folder path" if mode in ("live_ntfs", "folder", "formatted") else "Image file path")
+        self.path_label.configure(text="Drive or folder path" if mode in ("live_ntfs", "folder", "formatted", "versions") else "Image file path")
         ready = bool(value) or mode == "bin"
         if bin_target:
             text = "Search retained and emptied Recycle Bin records."
@@ -1245,18 +1248,20 @@ class RecoveryWindow(tk.Tk):
                 text = f"Search deleted NTFS records under {path} and scan their surviving free clusters."
         elif mode == "bin":
             text = "Search Recycle Bin records for items originally deleted from this folder."
+        elif mode == "versions":
+            text = "Choose or enter the original folder. Search every available snapshot of its drive."
         elif mode == "folder":
             text = "Find Recycle Bin items originally deleted from this folder."
         else:
             text = "Open a raw disk image such as .img, .dd, or .raw."
-        if self.can_scan_drives and mode in ("bin", "folder", "live_ntfs", "formatted"):
+        if self.can_scan_drives and mode in ("bin", "folder", "live_ntfs", "formatted", "versions"):
             launch = {True: "Running as administrator", False: "Standard launch", None: "Launch privileges unknown"}
             text = f"{launch[self.elevated]} · {text}"
         self.source_label.configure(text=text)
         self.start_button.configure(state="normal" if ready and self.job is None and not self.saving else "disabled")
 
     def choose_source(self):
-        if self.mode.get() in ("bin", "folder", "live_ntfs", "formatted"):
+        if self.mode.get() in ("bin", "folder", "live_ntfs", "formatted", "versions"):
             current = Path(self.source_text.get())
             chosen = filedialog.askdirectory(parent=self, title="Choose the original folder",
                                              initialdir=str(current) if current.is_dir() else None)
@@ -1282,7 +1287,7 @@ class RecoveryWindow(tk.Tk):
             if not value:
                 self.focus_path()
                 return
-            if mode in ("folder", "live_ntfs", "formatted"):
+            if mode in ("folder", "live_ntfs", "formatted", "versions"):
                 try:
                     source = selected_scope(value)
                 except ValueError as exc:
@@ -1355,17 +1360,19 @@ class RecoveryWindow(tk.Tk):
         self.preview_key = object()
         self.page_number = 0
         self.filter_button.configure(text="File type")
-        indexed = mode in ("live_ntfs", "ntfs_image", "bin", "folder")
+        indexed = mode in ("versions", "live_ntfs", "ntfs_image", "bin", "folder")
 
         self.facet_mode.set("Folder" if indexed else "Type")
         self.checked.clear()
         self.extensions.clear()
         self.files.clear()
+        self.version_view = mode == "versions"
         self.bin_view = mode in ("bin", "folder")
-        self.tree.heading("date", text="Date deleted" if self.bin_view else "Date modified")
+        self.tree.heading("date", text="Snapshot date" if mode == "versions" else "Date deleted" if self.bin_view else "Date modified")
         self.deleted_dates.clear()
         self.deleted_years.clear()
         self.modified_years.clear()
+        self.snapshot_dates.clear()
         self.originals.clear()
         self.materialized.clear()
         self.metadata.clear()
@@ -1396,7 +1403,9 @@ class RecoveryWindow(tk.Tk):
                 source = job["folder"] / "recovery-check.img"
                 with lzma.open(Path(__file__).with_name("recovery-check.img.xz")) as fixture, source.open("wb") as target:
                     shutil.copyfileobj(fixture, target)
-            if job["mode"] in ("bin", "folder"):
+            if job["mode"] == "versions":
+                scan_versions(source, job)
+            elif job["mode"] in ("bin", "folder"):
                 self.scan_bin(job, source if job["mode"] == "folder" else None)
             elif job.get("folder_scope"):
                 runs = []
@@ -1540,7 +1549,7 @@ class RecoveryWindow(tk.Tk):
                 self.next_render = monotonic() + (0.3 if self.sort.get() != "Discovery order" else 0)
             elapsed = elapsed_label(job["started"])
             records = job.get("records")
-            stage = {"formatted": "Searching raw sectors for surviving file contents", "live_ntfs": "Reading NTFS file table", "ntfs_image": "Reading filesystem index",
+            stage = {"versions": "Searching Windows shadow copies", "formatted": "Searching raw sectors for surviving file contents", "live_ntfs": "Reading NTFS file table", "ntfs_image": "Reading filesystem index",
                      "recover": "Carving disk image", "inspect": "Inspecting partition table",
                      "bin": "Reading Recycle Bin", "folder": "Reading Recycle Bin"}[job["mode"]]
             if job.get("raw_search") and job.get("only_free"):
@@ -1614,11 +1623,13 @@ class RecoveryWindow(tk.Tk):
             if bin_date and bin_date[0] is not None:
                 self.deleted_dates[key] = bin_date[0]
                 self.deleted_years.add(str(bin_date[0].year))
+            if len(bin_date) > 1:
+                self.snapshot_dates[key] = bin_date[1]
             self.files[key] = path
             self.metadata[key] = info
             if original is not None:
                 self.originals[key] = original
-            modified = self.modified_date(key)
+            modified = self.snapshot_dates.get(key) or self.modified_date(key)
             if modified != "Unknown":
                 self.modified_years.add(modified[:4])
             if isinstance(path, Candidate):
@@ -1720,6 +1731,12 @@ class RecoveryWindow(tk.Tk):
             summary = job["error"].splitlines()[0]
         elif job["self_test"]:
             summary = "Recovered Documents\\Important.bin from the test image and verified all 12,032 bytes."
+        if job["mode"] == "versions" and job["status"] == "complete":
+            summary = f"{job['snapshots']} Windows snapshots · {len(self.files):,} file versions · {elapsed}"
+            if job["unreadable"]:
+                summary += f" · {job['unreadable']} paths inaccessible"
+            if not job["snapshots"]:
+                summary = "Windows has no available shadow copies for this drive."
         self.activity.configure(text=summary)
         if job.get("folder_scope") and job["status"] == "complete":
             raw = job["sector_matches"]
@@ -1801,6 +1818,8 @@ class RecoveryWindow(tk.Tk):
         return self.recovery_checks.get(key, self.checks.get(key, "Unchecked"))
 
     def file_date(self, key):
+        if key in self.snapshot_dates:
+            return self.snapshot_dates[key]
         if self.bin_view:
             deleted = self.deleted_dates.get(key)
             return deleted.date().isoformat() if deleted else "Unknown"
@@ -1929,7 +1948,7 @@ class RecoveryWindow(tk.Tk):
                 submenu.add_radiobutton(label=choice, variable=self.year_filter, value=choice, command=self.render_files)
             self.filter_menu.add_separator()
         modified = tk.Menu(self.filter_menu, tearoff=False)
-        self.filter_menu.add_cascade(label="Date modified", menu=modified)
+        self.filter_menu.add_cascade(label="Snapshot date" if self.version_view else "Date modified", menu=modified)
         for choice in ("All dates", *sorted(self.modified_years, reverse=True), "Unknown date"):
             modified.add_radiobutton(label=choice, variable=self.modified_year_filter, value=choice, command=self.render_files)
         self.filter_menu.add_separator()
@@ -2084,6 +2103,8 @@ class RecoveryWindow(tk.Tk):
                 "Recoverability": self.check_label(key)}.get(self.group.get())
 
     def file_status(self, key):
+        if key in self.snapshot_dates:
+            return FILE_STATUSES[4]
         if isinstance(self.files[key], Candidate):
             return FILE_STATUSES[1]
         if key in self.originals:
@@ -2098,7 +2119,7 @@ class RecoveryWindow(tk.Tk):
     def matches_controls(self, key):
         path = self.display_path(key)
         if self.active_modified != "All dates":
-            stamp = self.modified_date(key)
+            stamp = self.snapshot_dates.get(key) or self.modified_date(key)
             year = "Unknown date" if stamp == "Unknown" else stamp[:4]
             if self.active_modified != year:
                 return False
@@ -2221,7 +2242,7 @@ class RecoveryWindow(tk.Tk):
                          values=("☑" if key in self.checked else "☐", str(path.parent) if key in self.originals else "",
                                  path.suffix.lstrip(".").upper(), size_label(self.metadata[key].st_size),
                                  self.file_date(key), {FILE_STATUSES[1]: "Deleted record", FILE_STATUSES[2]: "Still in bin",
-                                                       FILE_STATUSES[3]: "Raw scan"}[self.file_status(key)], check), tags=(check, "alternate") if int(key) % 2 else (check,))
+                                                       FILE_STATUSES[3]: "Raw scan", FILE_STATUSES[4]: "Shadow copy"}[self.file_status(key)], check), tags=(check, "alternate") if int(key) % 2 else (check,))
 
     def change_page(self, delta):
         self.page_number += delta
@@ -2245,8 +2266,8 @@ class RecoveryWindow(tk.Tk):
             self._current_filters = controls
             self.refresh_facets(render=False)
         self.size_button.configure(text=self.size_filter.get() if self.minimum_size else "File size")
-        self.date_button.configure(text="Date modified" if self.active_modified == "All dates" else self.active_modified)
-        status_names = ("File status", "Deleted", "Still in bin", "Raw scan")
+        self.date_button.configure(text=("Snapshot date" if self.version_view else "Date modified") if self.active_modified == "All dates" else self.active_modified)
+        status_names = ("File status", "Deleted", "Still in bin", "Raw scan", "Shadow copy")
         self.status_button.configure(text=status_names[FILE_STATUSES.index(self.active_status)])
         filters = [v for v in (self.extension, self.active_year)
                    if v not in ("All file types", "All dates")]
@@ -2412,6 +2433,8 @@ class RecoveryWindow(tk.Tk):
         self.details.pack(anchor="w", fill="x", pady=(10, 6))
         folder = str(display.parent) if key in self.originals else "Original folder unknown"
         bin_info = f"\n\nFile status\n{self.file_status(key)}"
+        if key in self.snapshot_dates:
+            bin_info += f"\nSnapshot: {self.snapshot_dates[key]}\nModified: {self.modified_date(key)}"
         if self.bin_view:
             bin_info += f"\nDate deleted: {self.file_date(key)}"
         saved = self.materialized.get(key)
@@ -2584,7 +2607,7 @@ class RecoveryWindow(tk.Tk):
                 path = output
             elif key in self.originals and saved is None:
                 if not ordinary(path):
-                    raise OSError("The Recycle Bin item is no longer available.")
+                    raise OSError("The source item is no longer available.")
                 preview_dir = Path(tempfile.mkdtemp(dir=RUNS.name))
                 copy = preview_dir / self.originals[key].name
                 shutil.copyfile(path, copy)
@@ -2620,6 +2643,7 @@ class RecoveryWindow(tk.Tk):
     def validate_destination(self, keys, folder):
         live_sources = {entry.source for key in keys
                         if isinstance(entry := self.files[key], Candidate) and entry.identity is None}
+        live_sources.update("\\\\.\\" + self.originals[key].drive for key in keys if key in self.snapshot_dates)
         if self.raw_source:
             live_sources.add(self.raw_source)
         for source in live_sources:
@@ -2637,13 +2661,13 @@ class RecoveryWindow(tk.Tk):
             self.validate_destination(self.files, destination.parent)
             with destination.open("w", encoding="utf-8-sig", newline="") as stream:
                 report = csv.writer(stream)
-                report.writerow(("Path", "Size (bytes)", "Date modified", "Date deleted", "Evidence"))
+                report.writerow(("Path", "Size (bytes)", "Date modified", "Date deleted", "Evidence", "Snapshot date"))
                 for key in self.files:
                     path = str(self.display_path(key))
                     # Keep recovered filenames from being interpreted as spreadsheet formulas.
                     if path.lstrip().startswith(("=", "+", "-", "@")):
                         path = "'" + path
-                    report.writerow((path, self.metadata[key].st_size, self.modified_date(key), self.file_date(key) if self.bin_view else "", self.check_label(key)))
+                    report.writerow((path, self.metadata[key].st_size, self.modified_date(key), self.file_date(key) if self.bin_view else "", self.check_label(key), self.snapshot_dates.get(key, "")))
         except OSError as exc:
             messagebox.showerror("Save scan report", str(exc))
 
