@@ -8,7 +8,7 @@ stage=$(mktemp -d)
 trap 'rm -rf "$stage"' EXIT
 root="$stage/Digger"
 mkdir -p "$root"/{runtime/sleuthkit,engines/63,source,licenses}
-cp "$project"/{recovery-check.img.xz,desktop.py,server.py,carved_results.py,media_preview.py,recycle_bin.py,ntfs_recovery.py,windows_volumes.py,recovery_output.py,recovered_format.py} "$root"
+cp "$project"/{recovery-check.img.xz,desktop.py,server.py,sector_catalog.py,media_preview.py,media_playback.py,recycle_bin.py,ntfs_recovery.py,windows_volumes.py,recovery_output.py,recovered_format.py} "$root"
 cp "$project/WINDOWS.md" "$root/Read me.md"
 cp "$project/launcher-win.c" "$project/tsk-windows-volume-length.patch" "$project/tsk-live-scan.patch" "$project/tsk-ntfs-record.patch" "$project/tsk-preview-reads.patch" "$root/source"
 compiler=${MINGW_CC:-"$inputs/mingw/usr/bin/x86_64-w64-mingw32-gcc-posix"}
@@ -23,8 +23,18 @@ unzip -q "$inputs"/pillow-*-cp313-cp313-win_amd64.whl -d "$root/runtime"
 av_wheel="$inputs/av-16.1.0-cp313-cp313-win_amd64.whl"
 unzip -q "$av_wheel" -d "$root/runtime"
 unzip -p "$av_wheel" av-16.1.0.dist-info/licenses/LICENSE.txt > "$root/licenses/PyAV.txt"
+cp /usr/share/doc/libjpeg62-turbo/copyright "$root/licenses/libjpeg-turbo.txt"
+cp /usr/share/doc/zlib1g/copyright "$root/licenses/zlib.txt"
 cp "$project/FFMPEG.txt" "$root/licenses/FFmpeg.txt"
 upstream="$inputs/upstream/testdisk-7.2"
+cp -R "$project/catalog" "$root/source/"
+if [[ -n ${CATALOG_EXE:-} ]]; then
+  cp "$CATALOG_EXE" "$root/engines/catalog.exe"
+else
+  "$project/catalog/build.sh" "$root/engines/catalog.exe"
+fi
+"$compiler" -municode -mwindows -Os -s "$project/catalog/player.c" -o "$root/engines/preview.exe" -lmfplay -lole32 -lgdi32
+cp "$upstream"/{libjpeg-62.dll,zlib1.dll,libssp-0.dll} "$root/engines/"
 cp "$upstream"/{testdisk_win.exe,photorec_win.exe,cyg*.dll,COPYING.txt,VERSION.txt,readme.txt} "$root/engines/"
 cp "$upstream/63/cygwin" "$root/engines/63/"
 cp "$inputs/testdisk-source.tar.bz2" "$inputs/tsk-source.tar.gz" "$root/source/"

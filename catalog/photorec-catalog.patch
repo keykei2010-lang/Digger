@@ -1,0 +1,390 @@
+--- a/src/file_jpg.c
++++ b/src/file_jpg.c
+@@ -2377,10 +2377,14 @@
+     log_info("%s marker ff%02x at 0x%x\n", file_recovery->filename, buffer[i+1], i);
+ #endif
+     offset+=(uint64_t)2+size;
+-    if(buffer[i+1]==0xe1)
++    if(buffer[i+1]==0xe1 && size>=8 && i+10<=nbytes && !memcmp(buffer+i+4,"Exif\0\0",6))
+     { /* APP1 Exif information */
+-      if(jpg_check_app1(file_recovery, extract_thumb, buffer, i, offset, size, nbytes, &thumb_offset)==0)
+-	return 0;
++      const uint64_t main_error=file_recovery->offset_error;
++      if(jpg_check_app1(file_recovery, extract_thumb, buffer, i, offset, size, nbytes, &thumb_offset)==0) {
++        /* Optional EXIF or thumbnail damage does not invalidate a decodable main image. */
++        file_recovery->offset_error=main_error;
++        thumb_offset=0;
++      }
+     }
+     else if(buffer[i+1]==0xc4)	/* DHT */
+     {
+@@ -2451,7 +2455,7 @@
+ #endif
+   if(file_recovery->offset_error!=0)
+     return ;
+-  thumb_offset=jpg_check_structure(file_recovery, 1);
++  thumb_offset=jpg_check_structure(file_recovery, 0);
+ #ifdef DEBUG_JPEG
+   log_info("jpg_check_structure error at %llu\n", (long long unsigned)file_recovery->offset_error);
+ #endif
+--- a/src/file_zip.c
++++ b/src/file_zip.c
+@@ -1123,7 +1123,10 @@
+     }
+     /* Only end of central dir is end of archive, 64b version of it is before */
+     if (header==ZIP_END_CENTRAL_DIR)
++    {
++      if(ext) fr->extension=ext;
+       return;
++    }
+     fr->offset_ok=file_size_old;
+   }
+ }
+--- a/src/filegen.h
++++ b/src/filegen.h
+@@ -21,6 +21,7 @@
+  */
+ #ifndef _TESTDISK_FILEGEN_H
+ #define _TESTDISK_FILEGEN_H
++struct param_disk_struct;
+ #ifdef __cplusplus
+ extern "C" {
+ #endif
+@@ -437,6 +438,7 @@
+ */
+ // assigns *stream \from *stream, indirect:offset, indirect:whence;
+ // assigns \result, errno \from indirect:*stream, indirect:offset, indirect:whence;
++#include "catalog_io.h"
+ int my_fseek(FILE *stream, off_t offset, int whence);
+ 
+ /*@
+--- a/src/hdaccess.c
++++ b/src/hdaccess.c
+@@ -1740,11 +1740,11 @@
+   if((testdisk_mode&TESTDISK_O_RDWR)==TESTDISK_O_RDWR)
+   {
+     mode=O_RDWR|O_EXCL|mode_basic;
+-    hd_h = open(device, mode);
++    hd_h = _wopen(_wgetenv(L"DIGGER_CATALOG_SOURCE"), mode);
+     if(hd_h<0 && (errno==EBUSY || errno==EINVAL))
+     {
+       mode=O_RDWR|mode_basic;
+-      hd_h = open(device, mode);
++      hd_h = _wopen(_wgetenv(L"DIGGER_CATALOG_SOURCE"), mode);
+     }
+     if(hd_h<0)
+     {
+@@ -1794,11 +1794,11 @@
+   {
+     testdisk_mode&=~TESTDISK_O_RDWR;
+     mode=O_RDONLY|O_EXCL|mode_basic;
+-    hd_h = open(device, mode);
++    hd_h = _wopen(_wgetenv(L"DIGGER_CATALOG_SOURCE"), mode);
+     if(hd_h<0 && (errno==EBUSY || errno==EINVAL))
+     {
+       mode=O_RDONLY|mode_basic;
+-      hd_h = open(device, mode);
++      hd_h = _wopen(_wgetenv(L"DIGGER_CATALOG_SOURCE"), mode);
+     }
+   }
+   if(hd_h<0)
+@@ -1976,7 +1976,7 @@
+ #endif
+       {
+ 	off_t pos;
+-	pos=lseek(hd_h,0,SEEK_END);
++	pos=_lseeki64(hd_h,0,SEEK_END);
+ 	if(pos>0 && (uint64_t)pos > disk_car->offset)
+ 	{
+ 	  /*@ assert pos > disk_car->offset; */
+--- a/src/phcli.c
++++ b/src/phcli.c
+@@ -190,8 +190,9 @@
+       }
+       if(params->carve_free_space_only>0)
+       {
+-	params->blocksize=remove_used_space(params->disk, params->partition, list_search_space);
+-      }
++	params->blocksize=catalog_free_space(params->disk, list_search_space);
++      }
++      else params->blocksize=params->disk->sector_size;
+       if(user_blocksize > 0)
+ 	params->blocksize=user_blocksize;
+       return 1;
+--- a/src/phmain.c
++++ b/src/phmain.c
+@@ -155,6 +155,8 @@
+ 
+ int main( int argc, char **argv )
+ {
++  if(argc!=4 || strcmp(argv[1],"/cmd") || strcmp(argv[2],"source.dd") ||
++     !_wgetenv(L"DIGGER_CATALOG_SOURCE")) return 2;
+   list_disk_t *list_disk=NULL;
+   /*@ assert list_disk == \null; */
+   /*@ assert valid_list_disk(list_disk); */
+@@ -324,6 +326,7 @@
+         params.cmd_run=argv[++i];
+         /* There is no log currently */
+         disk_car=file_test_availability(params.cmd_device, options.verbose, testdisk_mode);
++        if(disk_car && disk_car->offset) { disk_car->clean(disk_car); return 2; }
+ 	/*@ assert disk_car == \null || valid_disk(disk_car); */
+         if(disk_car==NULL)
+         {
+@@ -440,7 +443,7 @@
+   log_disk_list(list_disk);
+ #endif
+   reset_array_file_enable(options.list_file_format);
+-  file_options_load(options.list_file_format);
++  /* The application supplies its own format selection. */
+ #ifdef SUDO_BIN
+   if(list_disk==NULL && geteuid()!=0)
+   {
+--- a/src/photorec.c
++++ b/src/photorec.c
+@@ -66,6 +66,7 @@
+ #include "log.h"
+ #include "setdate.h"
+ #include "dfxml.h"
++#include "catalog_io.c"
+ 
+ /* #define DEBUG_FILE_FINISH */
+ /* #define DEBUG_UPDATE_SEARCH_SPACE */
+@@ -681,39 +682,9 @@
+ #endif
+     file_recovery->file_size=0;
+   }
+-  if(file_recovery->file_size==0)
+-  {
+-    if(paranoid==2)
+-      return ;
+-    fclose(file_recovery->handle);
+-    file_recovery->handle=NULL;
+-    /* File is zero-length; erase it */
+-    /*@ assert valid_read_string((const char *)file_recovery->filename); */
+-    unlink(file_recovery->filename);
+-    return;
+-  }
+-#if defined(HAVE_FTRUNCATE)
+-  fflush(file_recovery->handle);
+-  if(ftruncate(fileno(file_recovery->handle), file_recovery->file_size)<0)
+-  {
+-    log_critical("ftruncate failed.\n");
+-  }
+-#endif
+-  fclose(file_recovery->handle);
+   file_recovery->handle=NULL;
+-  if(file_recovery->time!=0 && file_recovery->time!=(time_t)-1)
+-    set_date(file_recovery->filename, file_recovery->time, file_recovery->time);
+-  /*@ assert valid_file_recovery(file_recovery); */
+-  if(file_recovery->file_rename!=NULL)
+-  {
+-    /*@ assert file_recovery->file_rename != \null; */
+-    /*@ assert \valid_function(file_recovery->file_rename); */
+-    file_recovery->file_rename(file_recovery);
+-  }
+-  if((++params->file_nbr)%MAX_FILES_PER_DIR==0)
+-  {
+-    params->dir_num=photorec_mkdir(params->recup_dir, params->dir_num+1);
+-  }
++  if(file_recovery->file_size==0) return;
++  params->file_nbr++;
+   if(params->status!=STATUS_EXT2_ON_SAVE_EVERYTHING &&
+       params->status!=STATUS_EXT2_OFF_SAVE_EVERYTHING &&
+       file_recovery->file_stat!=NULL)
+@@ -755,7 +726,7 @@
+   file_block_truncate(file_recovery, list_search_space, params->blocksize);
+   file_block_log(file_recovery, params->disk->sector_size);
+ #ifdef ENABLE_DFXML
+-  xml_log_file_recovered(file_recovery);
++  catalog_emit(file_recovery);
+ #endif
+   file_block_free(&file_recovery->location);
+   return 1;
+@@ -766,14 +737,7 @@
+   if(file_recovery->file_stat==NULL)
+     return ;
+   params->offset=file_recovery->location.start;
+-  if(file_recovery->handle)
+-  {
+-    fclose(file_recovery->handle);
+-    file_recovery->handle=NULL;
+-    /*@ assert valid_file_recovery(file_recovery); */
+-    /* File is zero-length; erase it */
+-    unlink(file_recovery->filename);
+-  }
++  file_recovery->handle=NULL;
+   file_block_truncate_zero(file_recovery, list_search_space);
+   reset_file_recovery(file_recovery);
+ }
+@@ -794,7 +758,7 @@
+   file_truncated=file_block_truncate(file_recovery, list_search_space, params->blocksize);
+   file_block_log(file_recovery, params->disk->sector_size);
+ #ifdef ENABLE_DFXML
+-  xml_log_file_recovered(file_recovery);
++  catalog_emit(file_recovery);
+ #endif
+   file_block_free(&file_recovery->location);
+   reset_file_recovery(file_recovery);
+--- a/src/photorec_check_header.h
++++ b/src/photorec_check_header.h
+@@ -137,11 +137,7 @@
+   set_filename(file_recovery, params);
+   if(file_recovery->file_stat->file_hint->recover==1)
+   {
+-#if defined(__CYGWIN__) || defined(__MINGW32__)
+-    file_recovery->handle=fopen_with_retry(file_recovery->filename,"w+b");
+-#else
+-    file_recovery->handle=fopen(file_recovery->filename,"w+b");
+-#endif
++    file_recovery->handle=catalog_begin(file_recovery, params->disk);
+     if(!file_recovery->handle)
+     {
+ #ifndef __FRAMAC__
+--- a/src/phrecn.c
++++ b/src/phrecn.c
+@@ -288,12 +288,11 @@
+ #endif
+   /*@ assert valid_read_string(params->recup_dir); */
+   /* make the first recup_dir */
+-  params->dir_num=photorec_mkdir(params->recup_dir, params->dir_num);
++  params->dir_num=1;
+ 
+ #ifdef ENABLE_DFXML
+   /* Open the XML output file */
+-  xml_open(params->recup_dir, params->dir_num);
+-  xml_setup(params->disk, params->partition);
++  printf("DGBEGIN\t%llu\t%u\n",(unsigned long long)params->disk->disk_real_size,params->disk->sector_size); fflush(stdout);
+ #endif
+   
+   /*@
+@@ -356,14 +355,15 @@
+       case STATUS_EXT2_ON_BF:
+       case STATUS_EXT2_OFF_BF:
+ #ifndef DISABLED_FOR_FRAMAC
+-	ind_stop=photorec_bf(params, options, list_search_space);
++	exit(10); /* The catalog engine only accepts the standard validated scan. */
+ #endif
+ 	break;
+       default:
+-	ind_stop=photorec_aux(params, options, list_search_space);
+-	break;
+-    }
+-    session_save(list_search_space, params, options);
++	if(!td_list_empty(&list_search_space->list))
++          ind_stop=photorec_aux(params, options, list_search_space);
++	break;
++    }
++    if(ind_stop!=PSTATUS_OK) exit(9);
+     if(need_to_stop!=0)
+       ind_stop=PSTATUS_STOP;
+     switch(ind_stop)
+@@ -421,8 +421,7 @@
+ 	break;
+       case PSTATUS_OK:
+ 	status_inc(params, options);
+-	if(params->status==STATUS_QUIT)
+-	  unlink("photorec.ses");
++	if(params->status==STATUS_QUIT) { puts("DGDONE"); fflush(stdout); }
+ 	break;
+     }
+ #ifndef DISABLED_FOR_FRAMAC
+--- a/src/psearchn.c
++++ b/src/psearchn.c
+@@ -76,6 +76,24 @@
+ #define READ_SIZE 1024*512
+ extern int need_to_stop;
+ 
++static void catalog_window(disk_t *disk, unsigned char *buf, uint64_t offset)
++{
++  uint64_t left=offset<disk->disk_real_size?disk->disk_real_size-offset:0;
++  unsigned int want=left<READ_SIZE?(unsigned int)left:READ_SIZE;
++  if(want<READ_SIZE) memset(buf+want,0,READ_SIZE-want);
++  if(want && disk->pread(disk,buf,want,offset)!=(int)want) {
++    unsigned int step=disk->sector_size;
++    for(unsigned int i=0;i<want;i+=step) {
++      unsigned int n=want-i<step?want-i:step;
++      if(disk->pread(disk,buf+i,n,offset+i)!=(int)n) {
++        memset(buf+i,0,n);
++        if(i==0 || i+step==want) printf("DGREADERR\t%llu\n",(unsigned long long)(offset+i));
++      }
++    }
++    puts("DGREADERR"); fflush(stdout);
++  }
++}
++
+ pstatus_t photorec_aux(struct ph_param *params, const struct ph_options *options, alloc_data_t *list_search_space)
+ {
+   pstatus_t ind_stop=PSTATUS_OK;
+@@ -131,7 +149,7 @@
+ 	(unsigned long long)((params->partition->part_size-1)/params->disk->sector_size));
+   }
+ #endif
+-  params->disk->pread(params->disk, buffer, READ_SIZE, offset);
++  catalog_window(params->disk,buffer,offset);
+   header_ignored(NULL);
+ #ifndef DISABLED_FOR_FRAMAC
+   /*@ loop invariant valid_file_recovery(&file_recovery); */
+@@ -184,23 +202,7 @@
+       {
+ 	if(file_recovery.handle!=NULL)
+ 	{
+-	  if(fwrite(buffer,blocksize,1,file_recovery.handle)<1)
+-	  { 
+-#ifndef DISABLED_FOR_FRAMAC
+-	    log_critical("Cannot write to file %s after %llu bytes: %s\n", file_recovery.filename, (long long unsigned)file_recovery.file_size, strerror(errno));
+-#endif
+-	    if(errno==EFBIG)
+-	    {
+-	      /* File is too big for the destination filesystem */
+-	      data_check_status=DC_STOP;
+-	    }
+-	    else
+-	    {
+-	      /* Warn the user */
+-	      ind_stop=PSTATUS_ENOSPC;
+-	      params->offset=file_recovery.location.start;
+-	    }
+-	  }
++	  catalog_append(buffer,blocksize);
+ 	}
+ 	if(ind_stop==PSTATUS_OK)
+ 	{
+@@ -333,21 +335,14 @@
+ 	    (unsigned long long)((params->partition->part_size-1)/params->disk->sector_size));
+       }
+ #endif
+-      if(params->disk->pread(params->disk, buffer, READ_SIZE, offset) != READ_SIZE)
+-      {
+-#ifdef HAVE_NCURSES
+-	wmove(stdscr,11,0);
+-	wclrtoeol(stdscr);
+-	wprintw(stdscr,"Error reading sector %10lu\n",
+-	    (unsigned long)((offset-params->partition->part_offset)/params->disk->sector_size));
+-#endif
+-      }
++      catalog_window(params->disk,buffer,offset);
+       if(ind_stop==PSTATUS_OK)
+       {
+         const time_t current_time=time(NULL);
+         if(current_time>previous_time)
+         {
+           previous_time=current_time;
++          printf("DGPOS\t%llu\n",(unsigned long long)offset); fflush(stdout);
+ #ifdef HAVE_NCURSES
+           ind_stop=photorec_progressbar(stdscr, params->pass, params, offset, current_time);
+ #endif
+@@ -364,12 +359,13 @@
+ 	    return PSTATUS_STOP;
+ 	  }
+ 	  if(current_time >= next_checkpoint)
+-	    next_checkpoint=regular_session_save(list_search_space, params, options, current_time);
++	    next_checkpoint=current_time+300;
+         }
+       }
+     }
+     file_recovered_old=file_recovered;
+   } /* end while(current_search_space!=list_search_space) */
++  if(file_recovery.handle) file_finish2(&file_recovery,params,options->paranoid,list_search_space);
+ #ifndef DISABLED_FOR_FRAMAC
+   free(buffer_start);
+ #endif
