@@ -1,9 +1,10 @@
+from io import BytesIO
 import tempfile
 import unittest
 import zlib
 from pathlib import Path
 
-from sector_catalog import parse_file
+from sector_catalog import folder_bitmap, parse_file
 
 
 class SectorCatalogTests(unittest.TestCase):
@@ -15,6 +16,18 @@ class SectorCatalogTests(unittest.TestCase):
         self.source.write_bytes(b"end" + bytes(1021) + b"start" + bytes(507))
         self.data = b"startend"
         self.fields = ["bin", "8", "0", str(zlib.crc32(self.data)), "", "1024,5", "0,3"]
+
+    def test_folder_bitmap_excludes_unrelated_and_allocated_clusters(self):
+        boundary = 65536 * 8
+        original = bytes([2]) + bytes(65537)
+        result = BytesIO()
+        folder_bitmap(BytesIO(original), result,
+                      [(0, 3), (boundary - 2, 6), (boundary, 2)], {"status": "running"})
+        mask = result.read()
+        self.assertEqual(len(mask), len(original))
+        self.assertEqual(mask[0], 0xfa)
+        self.assertEqual(mask[1:65535], b"\xff" * 65534)
+        self.assertEqual(mask[65535:], b"\x3f\xf0\xff")
 
     def entry(self):
         return parse_file(self.fields, str(self.source), None, self.source.stat().st_size, 512)

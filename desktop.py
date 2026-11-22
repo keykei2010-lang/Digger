@@ -27,7 +27,7 @@ from media_playback import play_sector_video
 from sector_catalog import SectorFile, scan_sectors
 from recovery_output import atomic_output, output_name
 from recovered_format import correct_extension, unique_path
-from ntfs_recovery import Candidate, extract as extract_ntfs, scan as scan_ntfs, seekable_preview
+from ntfs_recovery import Candidate, extract as extract_ntfs, scan as scan_ntfs, seekable_preview, ntfs_record
 from windows_volumes import (check_volume_read_access, is_elevated, local_volumes,
                              require_separate_disk, selected_scope, source_volume)
 
@@ -621,7 +621,7 @@ class RecoveryWindow(tk.Tk):
         self.nav_buttons = {}
         sidebar = (("Data recovery", (("live_ntfs", "Hardware disk", "Drive"), ("bin", "Recycle Bin", "Bin"),
                                      ("ntfs_image", "Disk image", "Image"))),
-                   ("Advanced recovery", (("formatted", "Deep scan drive", "Drive"), ("recover", "Deep scan image", "Image"),
+                   ("Advanced recovery", (("formatted", "Deep Scan", "Drive"), ("recover", "Deep scan image", "Image"),
                                           ("inspect", "Inspect partitions", "Image"), ("folder", "Bin by folder", "Folder"))))
         self.location_icons = {(kind, size): location_icon(kind, size) for kind in
                                ("Drive", "Bin", "Desktop", "Folder", "Image") for size in (21, 48)}
@@ -669,11 +669,18 @@ class RecoveryWindow(tk.Tk):
                  font=("Segoe UI Semibold", 12)).pack(anchor="w", pady=(0, 10))
         shortcuts = tk.Frame(self.locations_box, bg=BG)
         shortcuts.pack(fill="x")
+        self.shortcuts = {}
+        self.desktop_path = ""
+        if os.name == "nt":
+            folder = ctypes.create_unicode_buffer(260)
+            if ctypes.windll.shell32.SHGetFolderPathW(None, 0x10, None, 0, folder) == 0:
+                self.desktop_path = folder.value
         for index, (kind, title) in enumerate((("Bin","Recycle Bin"), ("Desktop","Desktop"), ("Folder","Select folder"), ("Image","Disk image"))):
             button = tk.Button(shortcuts, text="   " + title, image=self.location_icons[kind,48], compound="left",
                                anchor="w", bg=PANEL, fg=TEXT, activebackground=SELECT, activeforeground=TEXT,
                                highlightbackground=BORDER, highlightcolor=ACCENT, highlightthickness=1,
                                padx=10, pady=12, bd=0, cursor="hand2", command=lambda k=kind: self.shortcut(k))
+            self.shortcuts[kind] = (button, title)
             button.grid(row=index//2, column=index%2, sticky="ew", padx=(0, 8), pady=4)
             shortcuts.columnconfigure(index%2, weight=1, uniform="locations")
         self.path_panel = ttk.Frame(content)
@@ -701,7 +708,7 @@ class RecoveryWindow(tk.Tk):
         ttk.Label(self.carve_options, text="Look for").pack(side="left")
         ttk.Combobox(self.carve_options, state="readonly", textvariable=self.movie_filter,
                      values=("All file types", "MP4 / MOV movies"), width=24).pack(side="left", padx=8)
-        area = ttk.Frame(self.carve_options)
+        self.area_options = area = ttk.Frame(self.carve_options)
         area.pack(side="left", padx=(14, 0))
         ttk.Label(area, text="Scan area").pack(side="left", padx=(0, 6))
         ttk.Combobox(area, state="readonly", textvariable=self.scan_area,
@@ -720,21 +727,23 @@ class RecoveryWindow(tk.Tk):
 
     def shortcut(self, kind):
         if kind == "Bin":
-            self.pick_mode("bin")
-        elif kind == "Image":
-            self.pick_mode("ntfs_image")
-            self.path_entry.focus_set()
+            if self.mode.get() == "formatted":
+                drive = PureWindowsPath(self.source_text.get()).anchor
+                if not drive:
+                    messagebox.showinfo("Recycle Bin", "Choose the drive containing the Recycle Bin first.", parent=self)
+                    return
+                try:
+                    path = next(path for path in current_user_bins() if PureWindowsPath(path).anchor.casefold() == drive.casefold())
+                except (OSError, StopIteration, subprocess.SubprocessError):
+                    messagebox.showerror("Recycle Bin", "Could not locate your Recycle Bin on this drive.", parent=self)
+                    return
+                self.source_text.set(str(path))
+            else:
+                self.source_text.set("Recycle Bin")
         elif kind == "Desktop":
-            self.pick_mode("live_ntfs")
-            folder = ctypes.create_unicode_buffer(260)
-            if ctypes.windll.shell32.SHGetFolderPathW(None, 0x10, None, 0, folder) == 0:
-                self.source_text.set(folder.value)
+            self.source_text.set(self.desktop_path)
         else:
-            self.pick_mode("live_ntfs")
-            value = PureWindowsPath(self.source_text.get())
-            if not value.is_absolute() or value == PureWindowsPath(value.anchor):
-                self.source_text.set("")
-            self.path_entry.focus_set()
+            self.choose_source()
 
     def toggle_options(self):
         self.options_open = not self.options_open
@@ -1141,7 +1150,7 @@ class RecoveryWindow(tk.Tk):
     def layout_locations(self):
         mode = self.mode.get()
         titles = {"live_ntfs":"Select a location to search for lost data", "bin":"Search the Recycle Bin",
-                  "formatted":"Select a drive for deep scan", "folder":"Select the original folder",
+                  "formatted":"Deep Scan", "folder":"Select the original folder",
                   "recover":"Deep scan a disk image", "ntfs_image":"Search a disk image", "inspect":"Inspect disk partitions"}
         self.location_heading.configure(text=titles[mode])
         for key, button in self.nav_buttons.items():
@@ -1150,9 +1159,16 @@ class RecoveryWindow(tk.Tk):
             box.pack_forget()
         if mode in ("live_ntfs", "formatted"):
             self.drives_box.pack(fill="x")
+        kinds = (("Image",) if mode in ("ntfs_image", "recover", "inspect") else
+                 ("Desktop", "Folder") if mode == "folder" else ("Bin", "Desktop", "Folder"))
+        for kind, (button, _) in self.shortcuts.items():
+            if kind in kinds:
+                index = kinds.index(kind)
+                button.grid(row=index//2, column=index%2)
+            else:
+                button.grid_remove()
         self.locations_box.pack(fill="x", pady=(8,0))
-        if mode != "bin":
-            self.path_panel.pack(fill="x", pady=(8,0))
+        self.path_panel.pack(fill="x", pady=(8,0))
         if mode == "live_ntfs":
             self.depth_options.pack(fill="x", pady=(10, 0))
         self.options_button.configure(text="Hide scan options  ▴" if self.options_open else "Scan options  ▾")
@@ -1164,7 +1180,7 @@ class RecoveryWindow(tk.Tk):
         mode = self.mode.get()
         self.options_open = False
         self.layout_locations()
-        value = self.source_paths.get(mode, "")
+        value = self.source_paths.get(mode, "Recycle Bin" if mode == "bin" else "")
         if not value and mode in ("live_ntfs", "formatted"):
             value = next((r for r, fs in self.drive_roots.values() if fs.upper()=="NTFS"), next(iter(self.drive_roots),""))
         self.source_text.set(value)
@@ -1174,15 +1190,34 @@ class RecoveryWindow(tk.Tk):
         value = self.source_text.get().strip()
         self.source_paths[mode] = value
         for root, card in self.cards.items():
-            selected = root.casefold() == value.casefold()
+            selected = PureWindowsPath(root) == PureWindowsPath(value)
             card.itemconfigure("surface", fill=SELECT if selected else PANEL, outline=ACCENT if selected else BORDER)
             card.itemconfigure("check", state="normal" if selected else "hidden")
+        path = PureWindowsPath(value)
+        bin_target = value == "Recycle Bin"
+        kind = None
+        if value:
+            if mode in ("ntfs_image", "inspect", "recover"):
+                kind = "Image"
+            elif bin_target or (mode == "formatted" and len(path.parts) == 3 and path.parts[1].lower() == "$recycle.bin"):
+                kind = "Bin"
+            elif self.desktop_path and path == PureWindowsPath(self.desktop_path):
+                kind = "Desktop"
+            elif path.is_absolute() and path != PureWindowsPath(path.anchor):
+                kind = "Folder"
+        for name, (button, title) in self.shortcuts.items():
+            selected = name == kind
+            button.configure(text=("   ✓   " if selected else "   ") + title,
+                             bg=SELECT if selected else PANEL, highlightbackground=ACCENT if selected else BORDER,
+                             state="disabled" if name == "Desktop" and not self.desktop_path else "normal")
         labels = {"formatted": "Start deep scan", "live_ntfs": "Scan for deleted files", "bin": "Scan Recycle Bin", "folder": "Scan Recycle Bin",
                   "ntfs_image": "Scan image", "recover": "Deep scan image", "inspect": "Inspect image"}
         self.start_button.configure(text="Search for lost data" if mode == "live_ntfs" else labels[mode])
         self.path_label.configure(text="Drive or folder path" if mode in ("live_ntfs", "folder", "formatted") else "Image file path")
         ready = bool(value) or mode == "bin"
-        if mode == "live_ntfs":
+        if bin_target:
+            text = "Search retained and emptied Recycle Bin records."
+        elif mode == "live_ntfs":
             text = ("Search deleted records first, then scan unallocated space on this drive."
                     if self.scan_depth.get() == "Quick + deep" else "Quick scan reads deleted filesystem records.")
             if value:
@@ -1203,9 +1238,13 @@ class RecoveryWindow(tk.Tk):
                 except ValueError as exc:
                     text, ready = str(exc), False
         elif mode == "formatted":
+            self.area_options.pack(side="left", padx=(14, 0))
             text = "Browse sector matches as they appear. Choose where to save files when you click Recover."
+            if kind in ("Bin", "Folder", "Desktop"):
+                self.area_options.pack_forget()
+                text = f"Search deleted NTFS records under {path} and scan their surviving free clusters."
         elif mode == "bin":
-            text = "List retained items and search readable NTFS drives for emptied-bin files."
+            text = "Search Recycle Bin records for items originally deleted from this folder."
         elif mode == "folder":
             text = "Find Recycle Bin items originally deleted from this folder."
         else:
@@ -1217,12 +1256,12 @@ class RecoveryWindow(tk.Tk):
         self.start_button.configure(state="normal" if ready and self.job is None and not self.saving else "disabled")
 
     def choose_source(self):
-        if self.mode.get() in ("folder", "live_ntfs", "formatted"):
+        if self.mode.get() in ("bin", "folder", "live_ntfs", "formatted"):
             current = Path(self.source_text.get())
-            chosen = filedialog.askdirectory(title="Choose the original folder",
+            chosen = filedialog.askdirectory(parent=self, title="Choose the original folder",
                                              initialdir=str(current) if current.is_dir() else None)
         else:
-            chosen = filedialog.askopenfilename(filetypes=[
+            chosen = filedialog.askopenfilename(parent=self, filetypes=[
                 ("Raw disk images", "*.img *.dd *.raw *.bin *.ima"), ("All files", "*.*")])
         if chosen:
             self.source_text.set(chosen)
@@ -1231,6 +1270,10 @@ class RecoveryWindow(tk.Tk):
         if self.job is not None or self.saving:
             return
         mode = self.mode.get()
+        if mode in ("bin", "live_ntfs") and self.source_text.get() == "Recycle Bin":
+            mode = "bin"
+        elif mode == "bin":
+            mode = "folder"
         if sample:
             mode = "ntfs_image"
         source = None
@@ -1245,9 +1288,6 @@ class RecoveryWindow(tk.Tk):
                 except ValueError as exc:
                     messagebox.showerror("Scan source", str(exc))
                     return
-                if mode == "formatted" and source != PureWindowsPath(source.anchor):
-                    messagebox.showerror("Formatted drive", "Select a drive letter. A formatted-drive search reads the whole volume.")
-                    return
             else:
                 source = Path(value)
                 if not source.is_file():
@@ -1255,10 +1295,11 @@ class RecoveryWindow(tk.Tk):
                     return
         deep_after_quick = (mode == "live_ntfs" and source == PureWindowsPath(source.anchor)
                             and self.scan_depth.get() == "Quick + deep")
-        only_free = deep_after_quick or (mode == "formatted" and self.scan_area.get() == "Unallocated space only")
+        folder_deep = mode == "formatted" and source != PureWindowsPath(source.anchor)
+        only_free = folder_deep or deep_after_quick or (mode == "formatted" and self.scan_area.get() == "Unallocated space only")
         if only_free and not any(root.casefold() == source.anchor.casefold() and fs.upper() == "NTFS"
                                  for root, fs in self.drive_roots.values()):
-            messagebox.showerror("Scan area", "Unallocated-space scans require a mounted NTFS volume. Choose Whole volume for this source.", parent=self)
+            messagebox.showerror("Scan area", "Folder deep scans require a mounted NTFS volume." if folder_deep else "Unallocated-space scans require a mounted NTFS volume. Choose Whole volume for this source.", parent=self)
             return
         if mode in ("live_ntfs", "formatted"):
             try:
@@ -1292,6 +1333,8 @@ class RecoveryWindow(tk.Tk):
         self.open_output.pack_forget()
         self.job = {"folder": folder, "mode": mode, "status": "preparing", "matches": deque(),
                     "self_test": sample, "started": monotonic(), "source": str(source or ("Recycle Bin" if mode == "bin" else "Built-in NTFS test image"))}
+        if folder_deep:
+            self.job["folder_scope"] = True
         if has_raw_scan:
             self.job.update(device=device, movies_only=mode == "formatted" and self.movie_filter.get() == "MP4 / MOV movies",
                             only_free=only_free, deep_after_quick=deep_after_quick, raw_search=mode == "formatted")
@@ -1355,6 +1398,25 @@ class RecoveryWindow(tk.Tk):
                     shutil.copyfileobj(fixture, target)
             if job["mode"] in ("bin", "folder"):
                 self.scan_bin(job, source if job["mode"] == "folder" else None)
+            elif job.get("folder_scope"):
+                runs = []
+                job["phase"] = "Finding deleted file records belonging to the selected folder"
+                for entry in scan_ntfs(job["device"], source, job):
+                    if not job["movies_only"] or entry.original.suffix.lower() in (".mp4", ".mov"):
+                        job["matches"].append((entry, entry.original))
+                    try:
+                        _, layout = ntfs_record(entry)
+                    except OSError:
+                        continue
+                    if isinstance(layout, list):
+                        runs.extend(layout)
+                job["folder_runs"] = runs
+                job.pop("records", None)
+                job["phase"] = "Scanning free clusters mapped to the selected folder"
+                if runs and job["status"] != "stopping":
+                    scan_sectors(job, job["device"])
+                else:
+                    job["sector_matches"] = 0
             elif job["mode"] in ("formatted", "recover"):
                 scan_sectors(job, job.get("device") or source)
             elif job.get("deep_after_quick"):
@@ -1659,7 +1721,14 @@ class RecoveryWindow(tk.Tk):
         elif job["self_test"]:
             summary = "Recovered Documents\\Important.bin from the test image and verified all 12,032 bytes."
         self.activity.configure(text=summary)
-        if (job.get("raw_search") or job["mode"] == "recover") and job["status"] == "complete":
+        if job.get("folder_scope") and job["status"] == "complete":
+            raw = job["sector_matches"]
+            self.set_scan_status("Folder deep scan complete", color)
+            coverage = "No surviving cluster map for this folder" if not job["folder_runs"] else f"{raw:,} sector matches"
+            if job.get("read_errors"):
+                coverage += " · Some sectors were unreadable"
+            self.activity.configure(text=f"{len(self.files)-raw:,} file records · {coverage} · {elapsed}")
+        elif (job.get("raw_search") or job["mode"] == "recover") and job["status"] == "complete":
             area = "Unallocated space" if job.get("only_free") else "Whole image" if job["mode"] == "recover" else "Whole volume"
             raw = job["sector_matches"]
             indexed_count = len(self.files) - raw
@@ -1679,7 +1748,7 @@ class RecoveryWindow(tk.Tk):
         if indexed and not self.files and job["status"] == "complete" and not job.get("raw_search"):
             self.set_scan_status("Quick scan complete · No deleted records", color)
             self.set_log("No matching deleted filesystem records survived in the selected source. "
-                         "If you scanned a folder, try the whole drive. Use Deep scan drive to search raw sectors when the original records are gone.")
+                         "If you scanned a folder, try the whole drive. Use Deep Scan to search raw sectors when the original records are gone.")
         if is_bin and not self.files and job["status"] == "complete" and not bin_search:
             self.set_scan_status("Bin scan complete · No matches", color)
             self.set_log("This scan checked Recycle Bin records. Choose Deep scan a drive to look for surviving file contents.")
