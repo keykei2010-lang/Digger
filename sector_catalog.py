@@ -8,7 +8,6 @@ from pathlib import Path
 import re
 import subprocess
 import zlib
-from tempfile import TemporaryFile
 
 from ntfs_recovery import identity, tool
 from recovered_format import preferred_extension
@@ -122,44 +121,6 @@ def parse_file(fields, source, fingerprint, size, sector):
     return SectorFile(source, fingerprint, name, length, int(timestamp), int(crc), runs, sector)
 
 
-def folder_bitmap(bitmap, target, runs, job):
-    """Keep free only those clusters covered by surviving folder records."""
-    merged = []
-    for start, count in sorted(runs):
-        end = start + count
-        if merged and start <= merged[-1][1]:
-            merged[-1] = merged[-1][0], max(end, merged[-1][1])
-        else:
-            merged.append((start, end))
-    intervals = iter(merged)
-    span = next(intervals, None)
-    base = 0
-    while block := bitmap.read(65536):
-        if job["status"] == "stopping":
-            return
-        limit = base + len(block) * 8
-        mask = bytearray(len(block))
-        while span and span[0] < limit:
-            start, end = max(base, span[0]) - base, min(limit, span[1]) - base
-            while start < end and start % 8:
-                mask[start // 8] |= 1 << (start % 8)
-                start += 1
-            whole = (end - start) // 8
-            mask[start // 8:start // 8 + whole] = b"\xff" * whole
-            start += whole * 8
-            while start < end:
-                mask[start // 8] |= 1 << (start % 8)
-                start += 1
-            if span[1] > limit:
-                break
-            span = next(intervals, None)
-        allowed = int.from_bytes(mask, "little")
-        allocated = int.from_bytes(block, "little")
-        target.write(((~allowed | allocated) & ((1 << (8 * len(block))) - 1)).to_bytes(len(block), "little"))
-        base = limit
-    target.seek(0)
-
-
 def scan_sectors(job, source):
     source = str(source)
     live = source.startswith("\\\\.\\")
@@ -181,11 +142,6 @@ def scan_sectors(job, source):
                                               stdout=subprocess.PIPE, stderr=subprocess.DEVNULL))
         try:
             input_stream = bitmap.stdout if bitmap else subprocess.DEVNULL
-            if "folder_runs" in job:
-                input_stream = stack.enter_context(TemporaryFile(dir=job["folder"]))
-                folder_bitmap(bitmap.stdout, input_stream, job["folder_runs"], job)
-                if job["status"] == "stopping":
-                    return
             process = subprocess.Popen(args, stdin=input_stream,
                                        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                                        env={**os.environ, "DIGGER_CATALOG_SOURCE": source},

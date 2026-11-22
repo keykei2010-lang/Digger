@@ -28,7 +28,7 @@ from shadow_versions import scan_versions
 from sector_catalog import SectorFile, scan_sectors
 from recovery_output import atomic_output, output_name
 from recovered_format import correct_extension, unique_path
-from ntfs_recovery import Candidate, extract as extract_ntfs, scan as scan_ntfs, seekable_preview, ntfs_record
+from ntfs_recovery import Candidate, extract as extract_ntfs, scan as scan_ntfs, seekable_preview
 from windows_volumes import (check_volume_read_access, is_elevated, local_volumes,
                              require_separate_disk, selected_scope, source_volume)
 
@@ -418,6 +418,7 @@ class RecoveryWindow(tk.Tk):
         self.elevated = self.can_scan_drives and is_elevated()
         self.source_paths = {}
         self.drive_roots = {}
+        self.pinned_folder = None
         self.facet_rows = {}
         self.facet_counts = Counter()
         self.facet_bytes = Counter()
@@ -1244,8 +1245,7 @@ class RecoveryWindow(tk.Tk):
             self.area_options.pack(side="left", padx=(14, 0))
             text = "Browse sector matches as they appear. Choose where to save files when you click Recover."
             if kind in ("Bin", "Folder", "Desktop"):
-                self.area_options.pack_forget()
-                text = f"Search deleted NTFS records under {path} and scan their surviving free clusters."
+                text = f"Scan {path.anchor} and pin {path.name} in the results. Other folders remain available."
         elif mode == "bin":
             text = "Search Recycle Bin records for items originally deleted from this folder."
         elif mode == "versions":
@@ -1301,10 +1301,10 @@ class RecoveryWindow(tk.Tk):
         deep_after_quick = (mode == "live_ntfs" and source == PureWindowsPath(source.anchor)
                             and self.scan_depth.get() == "Quick + deep")
         folder_deep = mode == "formatted" and source != PureWindowsPath(source.anchor)
-        only_free = folder_deep or deep_after_quick or (mode == "formatted" and self.scan_area.get() == "Unallocated space only")
+        only_free = deep_after_quick or (mode == "formatted" and self.scan_area.get() == "Unallocated space only")
         if only_free and not any(root.casefold() == source.anchor.casefold() and fs.upper() == "NTFS"
                                  for root, fs in self.drive_roots.values()):
-            messagebox.showerror("Scan area", "Folder deep scans require a mounted NTFS volume." if folder_deep else "Unallocated-space scans require a mounted NTFS volume. Choose Whole volume for this source.", parent=self)
+            messagebox.showerror("Scan area", "Unallocated-space scans require a mounted NTFS volume. Choose Whole volume for this source.", parent=self)
             return
         if mode in ("live_ntfs", "formatted"):
             try:
@@ -1336,10 +1336,14 @@ class RecoveryWindow(tk.Tk):
         self.raw_source = device if has_raw_scan else None
         self.output_folder = None
         self.open_output.pack_forget()
+        self.pinned_folder = source if folder_deep else None
+        if mode == "formatted":
+            source = PureWindowsPath(source.anchor)
         self.job = {"folder": folder, "mode": mode, "status": "preparing", "matches": deque(),
                     "self_test": sample, "started": monotonic(), "source": str(source or ("Recycle Bin" if mode == "bin" else "Built-in NTFS test image"))}
-        if folder_deep:
-            self.job["folder_scope"] = True
+        if mode == "formatted":
+            self.job["index_volume"] = any(PureWindowsPath(root) == source and fs.upper() == "NTFS"
+                                           for root, fs in self.drive_roots.values())
         if has_raw_scan:
             self.job.update(device=device, movies_only=mode == "formatted" and self.movie_filter.get() == "MP4 / MOV movies",
                             only_free=only_free, deep_after_quick=deep_after_quick, raw_search=mode == "formatted")
@@ -1362,7 +1366,7 @@ class RecoveryWindow(tk.Tk):
         self.filter_button.configure(text="File type")
         indexed = mode in ("versions", "live_ntfs", "ntfs_image", "bin", "folder")
 
-        self.facet_mode.set("Folder" if indexed else "Type")
+        self.facet_mode.set("Folder" if indexed or self.pinned_folder else "Type")
         self.checked.clear()
         self.extensions.clear()
         self.files.clear()
@@ -1380,6 +1384,8 @@ class RecoveryWindow(tk.Tk):
         self.recovery_checks.clear()
         self.preview_pending = None
         self.clear_filters()
+        if self.pinned_folder:
+            self.set_scope("Folder", self.pinned_folder.parts)
         self.search.set("" if sample or mode == "formatted" else self.name_hint.get().strip())
         self.set_log("")
         self.set_scan_status("Starting scan", "#91bdff")
@@ -1407,27 +1413,19 @@ class RecoveryWindow(tk.Tk):
                 scan_versions(source, job)
             elif job["mode"] in ("bin", "folder"):
                 self.scan_bin(job, source if job["mode"] == "folder" else None)
-            elif job.get("folder_scope"):
-                runs = []
-                job["phase"] = "Finding deleted file records belonging to the selected folder"
-                for entry in scan_ntfs(job["device"], source, job):
-                    if not job["movies_only"] or entry.original.suffix.lower() in (".mp4", ".mov"):
-                        job["matches"].append((entry, entry.original))
-                    try:
-                        _, layout = ntfs_record(entry)
-                    except OSError:
-                        continue
-                    if isinstance(layout, list):
-                        runs.extend(layout)
-                job["folder_runs"] = runs
-                job.pop("records", None)
-                job["phase"] = "Scanning free clusters mapped to the selected folder"
-                if runs and job["status"] != "stopping":
-                    scan_sectors(job, job["device"])
-                else:
-                    job["sector_matches"] = 0
             elif job["mode"] in ("formatted", "recover"):
-                scan_sectors(job, job.get("device") or source)
+                if job.get("index_volume"):
+                    job["phase"] = f"Reading deleted file paths on {source}"
+                    try:
+                        for entry in scan_ntfs(job["device"], source, job):
+                            if not job["movies_only"] or entry.original.suffix.lower() in (".mp4", ".mov"):
+                                job["matches"].append((entry, entry.original))
+                    except OSError as exc:
+                        job["quick_warning"] = str(exc)
+                    job.pop("records", None)
+                    job["phase"] = f"Scanning sectors on {source}"
+                if job["status"] != "stopping":
+                    scan_sectors(job, job.get("device") or source)
             elif job.get("deep_after_quick"):
                 self.scan_quick_and_deep(job, source)
             elif job["mode"] in ("live_ntfs", "ntfs_image"):
@@ -1738,18 +1736,11 @@ class RecoveryWindow(tk.Tk):
             if not job["snapshots"]:
                 summary = "Windows has no available shadow copies for this drive."
         self.activity.configure(text=summary)
-        if job.get("folder_scope") and job["status"] == "complete":
-            raw = job["sector_matches"]
-            self.set_scan_status("Folder deep scan complete", color)
-            coverage = "No surviving cluster map for this folder" if not job["folder_runs"] else f"{raw:,} sector matches"
-            if job.get("read_errors"):
-                coverage += " · Some sectors were unreadable"
-            self.activity.configure(text=f"{len(self.files)-raw:,} file records · {coverage} · {elapsed}")
-        elif (job.get("raw_search") or job["mode"] == "recover") and job["status"] == "complete":
+        if (job.get("raw_search") or job["mode"] == "recover") and job["status"] == "complete":
             area = "Unallocated space" if job.get("only_free") else "Whole image" if job["mode"] == "recover" else "Whole volume"
             raw = job["sector_matches"]
             indexed_count = len(self.files) - raw
-            coverage = f"{indexed_count:,} from file records · {raw:,} from sectors" if job.get("deep_after_quick") else f"{raw:,} from sectors"
+            coverage = f"{indexed_count:,} from file records · {raw:,} from sectors" if job.get("deep_after_quick") or job.get("index_volume") else f"{raw:,} from sectors"
             if job.get("quick_warning"):
                 self.set_log(job["quick_warning"])
                 coverage += " · Quick scan incomplete"
@@ -1853,6 +1844,8 @@ class RecoveryWindow(tk.Tk):
         if key not in self.originals or "$OrphanFiles" in path.parts:
             return [("Unknown folder",)]
         parts = path.parent.parts
+        if self.pinned_folder and path.parent.is_relative_to(self.pinned_folder):
+            parts = self.pinned_folder.parts + path.parent.relative_to(self.pinned_folder).parts
         return [parts[:length] for length in range(1, len(parts) + 1)] or [("Unknown folder",)]
 
     def update_facet(self, value):
@@ -1927,9 +1920,17 @@ class RecoveryWindow(tk.Tk):
         selection = self.facet_filter or ()
         for size in range(1, len(selection)+1):
             self.facet_counts.setdefault(selection[:size], 0)
+        pinned = self.pinned_folder.parts if self.pinned_folder and mode == "Folder" else None
+        if pinned:
+            self.facet_counts.setdefault(pinned, 0)
         self.facet_rows.clear()
         for value in sorted(self.facet_counts):
             self.update_facet(value)
+        if pinned:
+            pin = self.facet_rows[pinned]
+            self.facet_list.move(pin, "", 0)
+            self.facet_list.tag_configure("pinned", foreground="#95c9ff")
+            self.facet_list.item(pin, text=pinned[-1], tags=("pinned",), open=True)
         row = self.facet_rows.get(self.facet_filter, "all")
         self.facet_list.selection_set(row)
         self.facet_list.see(row)
