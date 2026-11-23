@@ -1,11 +1,13 @@
 """Decode media thumbnails from seekable sources with bounded reads."""
 from pathlib import Path
+import textwrap
 
-from PIL import Image, UnidentifiedImageError
+from PIL import Image, ImageDraw, ImageFont, UnidentifiedImageError
 from recovered_format import preferred_extension
 
 IMAGE_TYPES = {".png", ".gif", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff", ".ico", ".avif", ".jp2",
                ".heic", ".heif", ".hif"}
+TEXT_TYPES = {".txt", ".log", ".csv", ".ini", ".json", ".md", ".xml"}
 HEIF_TYPES = {".heic", ".heif", ".hif", ".avif"}
 VIDEO_FORMATS = dict.fromkeys((".mp4", ".mov", ".m4v", ".3gp"), "mov")
 VIDEO_FORMATS.update(dict.fromkeys((".mkv", ".webm"), "matroska"))
@@ -18,6 +20,24 @@ def decode_preview(source, suffix, bounds=(1600, 1600)):
     if isinstance(source, Path):
         with source.open("rb") as stream:
             return decode_preview(stream, suffix, bounds)
+    if suffix in TEXT_TYPES:
+        data = source.read(8192)
+        encoding = "utf-16" if data.startswith((b"\xff\xfe", b"\xfe\xff")) else "utf-8-sig"
+        text = data.decode(encoding, errors="replace")
+        if "\x00" in text or not text.strip():
+            raise OSError("No readable text in the preview.")
+        width, height = min(bounds[0], 270), min(bounds[1], 260)
+        page = Image.new("RGB", (width, height), "white")
+        draw = ImageDraw.Draw(page)
+        font = ImageFont.load_default(size=15)
+        y = 8
+        for line in text.splitlines():
+            for part in textwrap.wrap(line, max(1, (width - 20) // 8)) or [""]:
+                draw.text((8, y), part, fill="#243448", font=font)
+                y += 19
+                if y >= height:
+                    return page, "Text preview"
+        return page, "Text preview"
     if suffix in IMAGE_TYPES | VIDEO_TYPES:
         detected = preferred_extension(source.read(8192), suffix)
         source.seek(0)
