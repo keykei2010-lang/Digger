@@ -2,6 +2,12 @@
 
 Extract the ZIP and run **Digger.exe**. The x64 desktop app runs offline. Keep the extracted files together. The launcher is unsigned.
 
+## Recover from a missing partition or repair media
+
+- **Lost partitions** accepts a Windows physical disk or a raw disk image. It searches surviving NTFS, FAT and exFAT boot sectors and lists files under each discovered partition. Existing table entries still supply deleted-file results. Physical disks need administrator access and 512-byte logical sectors. The search reads the source without replacing any partition-table entries. Save files to a separate physical disk.
+- **Hardware disk** also supports deleted-file scans of mounted FAT and exFAT volumes. Select **Deep Scan** separately if you need a sector scan.
+- **Repair media…** opens damaged MP4, MOV, M4V, 3GP, AVI, JPEG or PNG files. For a missing MP4 index, the repair engine looks for surviving H.264 or H.265 frames and can use a healthy reference clip from the same camera and settings. Digger writes a separate repaired copy and checks that a preview decodes. Check playback through the whole clip to see how much survived.
+
 ## Choose a scan
 
 - **Hardware disk** defaults to **Quick + deep** on a mounted NTFS volume. The quick stage reads deleted records and respects the original folder. When a drive is selected, the second stage indexes unallocated space across that volume. Folder searches stay within the selected path using surviving metadata. Both sets of results appear in the same session. Choose **Quick only** to stop after the filesystem records. Click a drive or enter an original folder path such as `C:\Users\You\Pictures`. To authorize raw reads, right-click **Digger.exe** and choose **Run as administrator**. If you click Scan without that access, Digger shows a warning and keeps your current window open. Save recovered files to a different physical disk. Digger opens the source for reading. Indexed scans read the volume’s file table, even for a folder search. They show matching deleted records as they arrive, with a measured record count. A surviving emptied-bin payload may appear under its Windows $R name. Native Windows testing of live recovery is pending.

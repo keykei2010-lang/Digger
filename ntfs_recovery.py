@@ -1,5 +1,6 @@
 """Indexed, read-only undelete using the bundled Sleuth Kit command-line tools."""
 from contextlib import contextmanager
+from itertools import chain
 from dataclasses import dataclass
 from functools import lru_cache
 from io import BufferedReader, BytesIO, RawIOBase
@@ -11,6 +12,8 @@ from tempfile import TemporaryFile
 from threading import Thread, Timer
 from recovery_output import atomic_output
 from server import LOCK
+from partition_search import boot_offsets
+from windows_volumes import disk_number
 
 TOOLS = Path(__file__).resolve().parent / "runtime" / "sleuthkit"
 BODY_SUFFIX = " (deleted)"
@@ -28,6 +31,7 @@ class Candidate:
     identity: tuple | None
     filesystem: str = "ntfs"
     sequence: int | None = None
+    allocated: bool = False
 
 
 def tool(name, arguments, **kwargs):
@@ -49,7 +53,7 @@ def safe_name(text):
     return text not in {"", ".", ".."} and not re.search(r'[<>:"/\\|?*\x00-\x1f]', text)
 
 
-def body_entry(line, source, offset, volume, fingerprint, filesystem="ntfs"):
+def body_entry(line, source, offset, volume, fingerprint, filesystem="ntfs", include_existing=False):
     fields = line.rstrip("\r\n").rsplit("|", 9)
     if len(fields) != 10:
         return None
@@ -57,10 +61,11 @@ def body_entry(line, source, offset, volume, fingerprint, filesystem="ntfs"):
     marker, separator, name = header.partition("|/")
     has_sequence = filesystem == "ntfs" and re.fullmatch(r"seq:[0-9]{1,5}", marker)
     supported_inode = ENTRY_ID.fullmatch(inode) if filesystem == "ntfs" else re.fullmatch(r"[0-9]+", inode)
-    if (not separator or (marker != "0" and not has_sequence) or not name.endswith(BODY_SUFFIX)
+    deleted = name.endswith(BODY_SUFFIX)
+    if (not separator or (marker != "0" and not has_sequence) or (not deleted and not include_existing)
             or not supported_inode or not mode.startswith(("r/r", "-/r"))):
         return None
-    parts = name[:-len(BODY_SUFFIX)].split("/")
+    parts = (name[:-len(BODY_SUFFIX)] if deleted else name).split("/")
     if not all(safe_name(part) for part in parts):
         return None
     try:
@@ -72,7 +77,7 @@ def body_entry(line, source, offset, volume, fingerprint, filesystem="ntfs"):
     prefix = volume + "\\" if volume.endswith(":") else volume
     sequence = int(marker[4:]) if has_sequence else None
     return Candidate(source, offset, inode, PureWindowsPath(prefix, *parts), size, modified, fingerprint, filesystem,
-                     sequence)
+                     sequence, not deleted)
 
 
 def partition_offsets(source, job):
@@ -114,20 +119,29 @@ def filesystem_at(source, offset):
 
 
 def scan(source, scope, job, include_bin_metadata=False):
-    fingerprint = None if scope is not None else identity(source)
+    fingerprint = None if scope is not None or disk_number(source) is not None else identity(source)
     offsets = [0] if scope is not None else [0, *partition_offsets(source, job)]
+    known = set(offsets)
+    if job.get("partition_search"):
+        job["valid_partitions"] = {}
+    if job.get("partition_search"):
+        offsets = chain(offsets, (offset for offset in boot_offsets(source, job["volume_bytes"], job)
+                                  if offset not in known))
     readable = False
     messages = []
     seen = set()
     for offset in offsets:
         if job["status"] == "stopping":
             return
-        filesystem = "ntfs" if scope is not None else filesystem_at(source, offset)
+        include_existing = offset not in known
+        filesystem = job.get("mounted_filesystem", "ntfs") if scope is not None else filesystem_at(source, offset)
         if filesystem is None:
             continue
         errors = bytearray()
-        arguments = ["-i", "raw", "-f", filesystem, "-o", str(offset), "-r", "-d", "-F", "-m", "/", source]
-        if os.name == "nt" and filesystem == "ntfs":
+        arguments = ["-i", "raw", "-f", filesystem, "-o", str(offset), "-r", "-F", "-m", "/", source]
+        if not include_existing:
+            arguments.insert(0, "-d")
+        if os.name == "nt" and filesystem == "ntfs" and not include_existing:
             arguments.insert(0, "-Q")
         with tool("fls", arguments, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process:
             def drain_errors():
@@ -140,14 +154,15 @@ def scan(source, scope, job, include_bin_metadata=False):
                 job["process"] = process
                 if job["status"] == "stopping":
                     process.terminate()
-            volume = scope.drive if scope is not None else (f"Partition-{offset}" if offset else "Image")
+            volume = (scope.drive if scope is not None else f"Lost partition {offset}" if include_existing
+                      else f"Partition-{offset}" if offset else "Image")
             for raw in process.stdout:
                 if raw.startswith(b"MFT "):
                     current, total = map(int, raw.split()[1:])
                     job["records"] = current, total
                     continue
-                row = body_entry(raw.decode("utf-8", "replace"), source, offset, volume, fingerprint, filesystem)
-                if row is None:
+                row = body_entry(raw.decode("utf-8", "replace"), source, offset, volume, fingerprint, filesystem, include_existing)
+                if row is None or (include_existing and filesystem == "ntfs" and int(row.inode.split("-")[0]) < 16):
                     continue
                 if scope is not None and not row.original.is_relative_to(scope):
                     continue
@@ -165,6 +180,8 @@ def scan(source, scope, job, include_bin_metadata=False):
                 job.pop("process", None)
         if not code:
             readable = True
+            if job.get("partition_search"):
+                job["valid_partitions"][offset, filesystem] = include_existing
         else:
             messages.append(errors.decode("utf-8", "replace").strip())
     if job["status"] == "stopping":
@@ -187,7 +204,7 @@ def check_identity(entry):
 
 def ntfs_record(entry):
     inode, _, attribute_id = entry.inode.split("-")
-    structured = os.name == "nt"
+    structured = os.name == "nt" and not entry.allocated
     arguments = ["-J" if structured else "-r", "-i", "raw", "-f", "ntfs", "-o", str(entry.offset),
                  entry.source, inode]
     with tool("istat", arguments, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process:
@@ -204,10 +221,11 @@ def ntfs_record(entry):
     if structured:
         return read_ntfs_record_status(entry, output, inode, attribute_id, virtual_name)
     fields = [line.strip() for line in output.splitlines()]
-    if b"Allocated File" in fields or b"Allocated Directory" in fields:
+    if not entry.allocated and (b"Allocated File" in fields or b"Allocated Directory" in fields):
         raise OSError("NTFS reports this record is in use. Rescan the volume to refresh the results.")
-    if b"Not Allocated File" not in fields:
-        raise OSError("The NTFS reader could not verify this is a deleted file.")
+    expected = b"Allocated File" if entry.allocated else b"Not Allocated File"
+    if expected not in fields:
+        raise OSError("The NTFS reader could not verify the file record’s allocation state.")
     if not virtual_name and not any(
         line.strip().decode("utf-8", "replace").casefold() == f"name: {entry.original.name}".strip().casefold()
         for line in output.splitlines()
@@ -219,6 +237,8 @@ def ntfs_record(entry):
     if index is None:
         raise OSError("The deleted NTFS entry changed. Scan the drive again.")
     header = fields[index]
+    if entry.allocated:
+        return output, "Expected bytes read"
     if b" Non-Resident" not in header:
         return output, "Resident NTFS data"
     if any(flag in header for flag in (b"Compressed", b"Encrypted", b"Sparse")):
@@ -306,7 +326,22 @@ def contains_allocated(bitmap, first, count):
 def recovery_evidence(entry):
     check_identity(entry)
     if entry.filesystem != "ntfs":
-        return None, "Expected bytes read"
+        if entry.identity is not None:
+            return None, "Expected bytes read"
+        args = ["-i", "raw", "-f", entry.filesystem, "-o", str(entry.offset), entry.source, entry.inode]
+        with tool("istat", args, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process:
+            try:
+                record, _ = process.communicate(timeout=20)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                raise OSError("Timed out checking the FAT directory entry.") from None
+        allocation = rb"(?m)^(?:Allocated|Not Allocated)\s*$"
+        match = re.search(allocation, record)
+        expected = b"Allocated" if entry.allocated else b"Not Allocated"
+        size_matches = re.search(rb"(?mi)^Size:\s*" + str(entry.st_size).encode() + rb"\s*$", record)
+        if process.returncode or not match or match[0].strip() != expected or not size_matches:
+            raise OSError("The FAT directory entry no longer matches the scan.")
+        return record, "Expected bytes read"
     record, runs = ntfs_record(entry)
     if isinstance(runs, str):
         return record, runs
@@ -330,7 +365,9 @@ def ensure_current(entry):
 
 def stream_recovery(entry, target):
     before, evidence = recovery_evidence(entry)
-    arguments = ["-r", "-i", "raw", "-f", entry.filesystem, "-o", str(entry.offset), entry.source, entry.inode]
+    arguments = ["-i", "raw", "-f", entry.filesystem, "-o", str(entry.offset), entry.source, entry.inode]
+    if not entry.allocated:
+        arguments.insert(0, "-r")
     with TemporaryFile() as errors, tool("icat", arguments, stdout=subprocess.PIPE, stderr=errors) as process:
         remaining = entry.st_size
         try:

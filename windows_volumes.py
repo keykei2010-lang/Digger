@@ -67,8 +67,9 @@ def physical_disks(path):
 
 
 def require_separate_disk(source, destination):
-    root = source[-2:] + "\\"
-    if physical_disks(root) & physical_disks(destination):
+    number = disk_number(source)
+    origins = {number} if number is not None else physical_disks(source[-2:] + "\\")
+    if origins & physical_disks(destination):
         raise OSError("Choose a recovery destination on a different physical disk.")
 
 
@@ -135,3 +136,43 @@ def is_elevated():
         return None
     finally:
         api.CloseHandle(token)
+
+
+def physical_device(number):
+    return r"\\.\PhysicalDrive" + str(number)
+
+
+def disk_number(value):
+    prefix = physical_device("")
+    if value.casefold().startswith(prefix.casefold()):
+        number = value[len(prefix):]
+        if number.isascii() and number.isdecimal() and len(number) <= 5:
+            return int(number)
+    return None
+
+
+def disk_geometry(source):
+    """Return capacity and logical sector size through a read-only handle."""
+    api = kernel()
+    device = api.CreateFileW(source, 0, 7, None, 3, 0, None)
+    if device == ctypes.c_void_p(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    buffer = ctypes.create_string_buffer(1024)
+    written = wintypes.DWORD()
+    try:
+        if not api.DeviceIoControl(device, 0x700a0, None, 0, buffer, len(buffer), ctypes.byref(written), None):
+            raise ctypes.WinError(ctypes.get_last_error())
+        if written.value < 32:
+            raise OSError("Windows returned incomplete disk geometry.")
+        return int.from_bytes(buffer[24:32], "little"), int.from_bytes(buffer[20:24], "little")
+    finally:
+        api.CloseHandle(device)
+
+
+def physical_disk_numbers():
+    names = ctypes.create_unicode_buffer(65536)
+    if not kernel().QueryDosDeviceW(None, names, len(names)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    prefix = physical_device("")
+    return sorted(number for name in names[:].split("\0")
+                  if (number := disk_number(prefix + name.removeprefix("PhysicalDrive"))) is not None)

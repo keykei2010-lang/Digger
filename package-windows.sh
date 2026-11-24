@@ -8,7 +8,10 @@ stage=$(mktemp -d)
 trap 'rm -rf "$stage"' EXIT
 root="$stage/Digger"
 mkdir -p "$root"/{runtime/sleuthkit,engines/63,source,licenses}
-cp "$project"/{recovery-check.img.xz,desktop.py,server.py,shadow_versions.py,sector_catalog.py,media_preview.py,media_playback.py,recycle_bin.py,ntfs_recovery.py,windows_volumes.py,recovery_output.py,recovered_format.py} "$root"
+cp "$project"/{recovery-check.img.xz,desktop.py,server.py,shadow_versions.py,sector_catalog.py,media_preview.py,media_repair.py,partition_search.py,media_playback.py,recycle_bin.py,ntfs_recovery.py,windows_volumes.py,recovery_output.py,recovered_format.py} "$root"
+cp -R "$project/repair" "$root/"
+cp "$inputs/repair-node.exe.xz" "$root/engines/"
+cp "$inputs/repair-node-LICENSE" "$root/licenses/Node.js.txt"
 cp "$project/WINDOWS.md" "$root/Read me.md"
 cp "$project/launcher-win.c" "$project/tsk-windows-volume-length.patch" "$project/tsk-live-scan.patch" "$project/tsk-ntfs-record.patch" "$project/tsk-preview-reads.patch" "$root/source"
 compiler=${MINGW_CC:-"$inputs/mingw/usr/bin/x86_64-w64-mingw32-gcc-posix"}

@@ -23,13 +23,15 @@ from tkinter import filedialog, messagebox, ttk
 
 from PIL import Image, ImageDraw, ImageTk
 
+from media_repair import REPAIR_FORMATS, repair_media
 from media_playback import play_sector_video
 from shadow_versions import scan_versions
 from sector_catalog import SectorFile, scan_sectors
 from recovery_output import atomic_output, output_name
 from recovered_format import correct_extension, unique_path
 from ntfs_recovery import Candidate, extract as extract_ntfs, scan as scan_ntfs, seekable_preview
-from windows_volumes import (check_volume_read_access, is_elevated, local_volumes,
+from windows_volumes import (check_volume_read_access, disk_geometry, disk_number, physical_device, physical_disk_numbers,
+                             is_elevated, local_volumes,
                              require_separate_disk, selected_scope, source_volume)
 
 from media_preview import IMAGE_TYPES, VIDEO_TYPES, TEXT_TYPES, decode_preview
@@ -53,7 +55,7 @@ SELECT = "#cedeFF"
 SIZE_FILTERS = {"All sizes": 0, "At least 100 KB": 100_000, "At least 1 MB": 1_000_000,
                 "At least 10 MB": 10_000_000, "At least 100 MB": 100_000_000}
 THUMBNAIL_BOUNDS = (288, 208)
-FILE_STATUSES = ("All statuses", "Deleted record", "Still in Recycle Bin", "Raw scan · status unknown", "Shadow copy")
+FILE_STATUSES = ("All statuses", "Deleted record", "Still in Recycle Bin", "Raw scan · status unknown", "Shadow copy", "Lost partition file")
 PREFERENCES = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "Digger" / "preferences.json"
 SORTS = ("Discovery order", "Name", "Size", "File date", "Type", "Recoverability")
 GROUPS = ("None", "Original folder", "Type", "File date", "Recoverability")
@@ -475,6 +477,8 @@ class RecoveryWindow(tk.Tk):
         self.group = tk.StringVar(value="None")
         self.preview_events = queue.SimpleQueue()
         self.play_errors = queue.SimpleQueue()
+        self.repair_events = queue.SimpleQueue()
+        self.repairing = False
         self.preview_pending = None
         self.preview_active = False
         self.preview_key = None
@@ -628,7 +632,7 @@ class RecoveryWindow(tk.Tk):
         sidebar = (("Data recovery", (("live_ntfs", "Hardware disk", "Drive"), ("bin", "Recycle Bin", "Bin"),
                                      ("ntfs_image", "Disk image", "Image"))),
                    ("Advanced recovery", (("formatted", "Deep Scan", "Drive"), ("recover", "Deep scan image", "Image"),
-                                          ("versions", "Previous versions", "Folder"), ("inspect", "Inspect partitions", "Image"), ("folder", "Bin by folder", "Folder"))))
+                                          ("versions", "Previous versions", "Folder"), ("inspect", "Inspect partitions", "Image"), ("partitions", "Lost partitions", "Drive"), ("folder", "Bin by folder", "Folder"))))
         self.location_icons = {(kind, size): location_icon(kind, size) for kind in
                                ("Drive", "Bin", "Desktop", "Folder", "Image") for size in (21, 48)}
         for section, items in sidebar:
@@ -642,7 +646,9 @@ class RecoveryWindow(tk.Tk):
                 self.nav_buttons[mode] = button
         self.demo = tk.Button(rail, text="Test deleted-file recovery", bg=DARK, fg=MUTED, bd=0,
                               activebackground=SELECT, activeforeground=TEXT, command=lambda: self.start_scan(True))
-        self.demo.pack(side="bottom", anchor="w", padx=16, pady=16)
+        self.demo.pack(side="bottom", anchor="w", padx=16, pady=(3, 12))
+        ttk.Button(rail, text="Repair media…", command=self.choose_media_repair).pack(side="bottom", fill="x", padx=8)
+
         main = tk.Frame(page, bg=BG)
         main.pack(fill="both", expand=True)
         footer = tk.Frame(main, bg=BG, highlightthickness=1, highlightbackground=SURFACE)
@@ -695,6 +701,8 @@ class RecoveryWindow(tk.Tk):
         self.path_entry = ttk.Entry(self.path_panel, textvariable=self.source_text)
         self.path_entry.pack(side="left", fill="x", expand=True)
         self.path_entry.bind("<Return>", lambda _: self.start_scan(False))
+        self.physical_picker = ttk.Button(self.path_panel, text="Physical disk…", command=self.choose_physical_disk)
+
         ttk.Button(self.path_panel, text="Browse…", command=self.choose_source).pack(side="left", padx=(6,0))
         self.options_button = tk.Button(content, text="Scan options  ▾", bg=BG, fg=MUTED, bd=0,
                                         activebackground=BG, activeforeground=TEXT, command=self.toggle_options)
@@ -1164,7 +1172,7 @@ class RecoveryWindow(tk.Tk):
 
     def layout_locations(self):
         mode = self.mode.get()
-        titles = {"versions":"Search previous versions", "live_ntfs":"Select a location to search for lost data", "bin":"Search the Recycle Bin",
+        titles = {"partitions":"Find lost partitions", "versions":"Search previous versions", "live_ntfs":"Select a location to search for lost data", "bin":"Search the Recycle Bin",
                   "formatted":"Deep Scan", "folder":"Select the original folder",
                   "recover":"Deep scan a disk image", "ntfs_image":"Search a disk image", "inspect":"Inspect disk partitions"}
         self.location_heading.configure(text=titles[mode])
@@ -1174,7 +1182,7 @@ class RecoveryWindow(tk.Tk):
             box.pack_forget()
         if mode in ("live_ntfs", "formatted"):
             self.drives_box.pack(fill="x")
-        kinds = (("Image",) if mode in ("ntfs_image", "recover", "inspect") else
+        kinds = (("Image",) if mode in ("ntfs_image", "recover", "inspect", "partitions") else
                  ("Desktop", "Folder") if mode in ("folder", "versions") else ("Bin", "Desktop", "Folder"))
         for kind, (button, _) in self.shortcuts.items():
             if kind in kinds:
@@ -1184,6 +1192,10 @@ class RecoveryWindow(tk.Tk):
                 button.grid_remove()
         self.locations_box.pack(fill="x", pady=(8,0))
         self.path_panel.pack(fill="x", pady=(8,0))
+        if mode == "partitions":
+            self.physical_picker.pack(side="right", padx=(6, 0))
+        else:
+            self.physical_picker.pack_forget()
         if mode == "live_ntfs":
             self.depth_options.pack(fill="x", pady=(10, 0))
         self.options_button.configure(text="Hide scan options  ▴" if self.options_open else "Scan options  ▾")
@@ -1225,7 +1237,7 @@ class RecoveryWindow(tk.Tk):
             button.configure(text=("   ✓   " if selected else "   ") + title,
                              bg=SELECT if selected else PANEL, highlightbackground=ACCENT if selected else BORDER,
                              state="disabled" if name == "Desktop" and not self.desktop_path else "normal")
-        labels = {"versions": "Search snapshots", "formatted": "Start deep scan", "live_ntfs": "Scan for deleted files", "bin": "Scan Recycle Bin", "folder": "Scan Recycle Bin",
+        labels = {"partitions": "Search partitions", "versions": "Search snapshots", "formatted": "Start deep scan", "live_ntfs": "Scan for deleted files", "bin": "Scan Recycle Bin", "folder": "Scan Recycle Bin",
                   "ntfs_image": "Scan image", "recover": "Deep scan image", "inspect": "Inspect image"}
         self.start_button.configure(text="Search for lost data" if mode == "live_ntfs" else labels[mode])
         self.path_label.configure(text="Drive or folder path" if mode in ("live_ntfs", "folder", "formatted", "versions") else "Image file path")
@@ -1235,6 +1247,7 @@ class RecoveryWindow(tk.Tk):
         elif mode == "live_ntfs":
             text = ("Search deleted records first, then scan unallocated space on this drive."
                     if self.scan_depth.get() == "Quick + deep" else "Quick scan reads deleted filesystem records.")
+            self.folder_depth.configure(text="Deleted records in this folder")
             if value:
                 try:
                     scope = selected_scope(os.path.expandvars(value))
@@ -1247,8 +1260,13 @@ class RecoveryWindow(tk.Tk):
                         text = f"Search deleted records under {scope}. To include files with unknown paths, deep scan {scope.drive} separately."
                     filesystem = next((fs for root, fs in self.drive_roots.values()
                                        if root.casefold() == scope.anchor.casefold()), None)
-                    if filesystem and filesystem.upper() != "NTFS":
-                        text = f"{scope.drive} uses {filesystem}. To scan this filesystem, open a disk image."
+                    if filesystem and filesystem.upper() in ("FAT", "FAT12", "FAT16", "FAT32", "EXFAT"):
+                        self.depth_picker.pack_forget()
+                        self.folder_depth.configure(text="Deleted FAT/exFAT records")
+                        self.folder_depth.pack(side="left")
+                        text = f"Search {scope} for deleted {filesystem} entries. Deep Scan is available separately."
+                    elif filesystem and filesystem.upper() != "NTFS":
+                        text = f"{scope.drive} uses {filesystem}. Choose Deep Scan to search sectors."
                         ready = False
                 except ValueError as exc:
                     text, ready = str(exc), False
@@ -1259,6 +1277,9 @@ class RecoveryWindow(tk.Tk):
                 text = f"Scan {path.anchor} and pin {path.name} in the results. Other folders remain available."
         elif mode == "bin":
             text = "Search Recycle Bin records for items originally deleted from this folder."
+        elif mode == "partitions":
+            text = "Choose a physical disk or raw disk image. Digger searches for surviving NTFS, FAT and exFAT boot sectors."
+            self.path_label.configure(text="Physical disk or raw image")
         elif mode == "versions":
             text = "Choose or enter the original folder. Search every available snapshot of its drive."
         elif mode == "folder":
@@ -1270,6 +1291,66 @@ class RecoveryWindow(tk.Tk):
             text = f"{launch[self.elevated]} · {text}"
         self.source_label.configure(text=text)
         self.start_button.configure(state="normal" if ready and self.job is None and not self.saving else "disabled")
+
+    def choose_physical_disk(self):
+        try:
+            disks = physical_disk_numbers()
+        except OSError as exc:
+            messagebox.showerror("Physical disks", str(exc), parent=self)
+            return
+        if not disks:
+            messagebox.showinfo("Physical disks", "Windows did not report any physical disks.", parent=self)
+            return
+        dialog = self.modal("Choose a physical disk")
+        listing = ttk.Treeview(dialog, columns=("capacity",), show="tree headings", selectmode="browse")
+        listing.heading("#0", text="Windows disk")
+        listing.heading("capacity", text="Capacity")
+        listing.pack(fill="both", expand=True, padx=12, pady=12)
+        for number in disks:
+            try:
+                capacity, _ = disk_geometry(physical_device(number))
+                label = size_label(capacity)
+            except OSError:
+                label = "Unavailable"
+            listing.insert("", "end", iid=str(number), text=f"Disk {number}", values=(label,))
+        def select(_event=None):
+            if listing.selection():
+                self.source_text.set(physical_device(listing.selection()[0]))
+                dialog.destroy()
+        button = ttk.Button(dialog, text="Select disk", command=select)
+        button.pack(pady=(0, 12))
+        listing.bind("<Double-1>", select)
+        self.wait_for_modal(dialog, 535, 360, listing)
+
+    def choose_media_repair(self):
+        if self.repairing:
+            messagebox.showinfo("Media repair", "A repair is already running.", parent=self)
+            return
+        patterns = " ".join("*" + ext for ext in REPAIR_FORMATS)
+        source = filedialog.askopenfilename(parent=self, title="Choose damaged media",
+                                            filetypes=[("Supported media", patterns)])
+        if not source:
+            return
+        reference = ""
+        if Path(source).suffix.lower() in (".mp4", ".mov", ".m4v", ".3gp", ".jpg", ".jpeg"):
+            if messagebox.askyesno("Reference file", "Use a healthy clip or photo from the same device and settings?",
+                                   parent=self):
+                reference = filedialog.askopenfilename(parent=self, title="Choose a healthy reference file",
+                                                        filetypes=[("Supported media", patterns)])
+                if not reference:
+                    return
+        destination = filedialog.askdirectory(parent=self, title="Save repaired copy to",
+                                              initialdir=str(Path(source).parent))
+        if not destination:
+            return
+        self.repairing = True
+        self.show_admin_warning("Media repair started", "Digger is writing a separate repaired copy. A large video may take several minutes.")
+        def work():
+            try:
+                self.repair_events.put(repair_media(Path(source), Path(destination), Path(reference) if reference else None))
+            except (ValueError, OSError, RuntimeError, subprocess.SubprocessError) as exc:
+                self.repair_events.put((None, str(exc)))
+        threading.Thread(target=work, daemon=True).start()
 
     def choose_source(self):
         if self.mode.get() in ("bin", "folder", "live_ntfs", "formatted", "versions"):
@@ -1293,6 +1374,8 @@ class RecoveryWindow(tk.Tk):
         if sample:
             mode = "ntfs_image"
         source = None
+        physical = False
+        capacity = 0
         if not sample and mode != "bin":
             value = os.path.expandvars(self.source_text.get().strip().strip('"'))
             if not value:
@@ -1304,12 +1387,34 @@ class RecoveryWindow(tk.Tk):
                 except ValueError as exc:
                     messagebox.showerror("Scan source", str(exc))
                     return
+            elif mode == "partitions" and (number := disk_number(value)) is not None:
+                source = physical_device(number)
+                physical = True
             else:
                 source = Path(value)
                 if not source.is_file():
                     messagebox.showerror("Scan source", "Choose an existing disk image file.")
                     return
-        deep_after_quick = (mode == "live_ntfs" and source == PureWindowsPath(source.anchor)
+        source_fs = next((fs.upper() for root, fs in self.drive_roots.values()
+                          if mode == "live_ntfs" and PureWindowsPath(root) == PureWindowsPath(source.anchor)), "NTFS")
+        if mode == "partitions":
+            try:
+                if physical:
+                    check_volume_read_access(source)
+                    capacity, logical_sector = disk_geometry(source)
+                    if logical_sector != 512:
+                        raise OSError("Partition search currently supports 512-byte logical sectors.")
+                else:
+                    capacity = source.stat().st_size
+                if capacity < 512 or capacity % 512:
+                    raise OSError("Choose a sector-aligned raw image or physical disk.")
+            except OSError as exc:
+                if self.needs_admin(exc):
+                    self.show_admin_warning("Windows blocked physical disk access", "Run Digger as administrator and try again.")
+                else:
+                    messagebox.showerror("Partition search", str(exc), parent=self)
+                return
+        deep_after_quick = (mode == "live_ntfs" and source_fs == "NTFS" and source == PureWindowsPath(source.anchor)
                             and self.scan_depth.get() == "Quick + deep")
         folder_deep = mode == "formatted" and source != PureWindowsPath(source.anchor)
         only_free = deep_after_quick or (mode == "formatted" and self.scan_area.get() == "Unallocated space only")
@@ -1352,6 +1457,10 @@ class RecoveryWindow(tk.Tk):
             source = PureWindowsPath(source.anchor)
         self.job = {"folder": folder, "mode": mode, "status": "preparing", "matches": deque(),
                     "self_test": sample, "started": monotonic(), "source": str(source or ("Recycle Bin" if mode == "bin" else "Built-in NTFS test image"))}
+        if mode == "partitions":
+            self.job.update(partition_search=True, volume_bytes=capacity)
+        if mode == "live_ntfs":
+            self.job["mounted_filesystem"] = ("exfat" if source_fs == "EXFAT" else "fat" if source_fs.startswith("FAT") else "ntfs")
         if mode == "formatted":
             self.job["index_volume"] = any(PureWindowsPath(root) == source and fs.upper() == "NTFS"
                                            for root, fs in self.drive_roots.values())
@@ -1375,7 +1484,7 @@ class RecoveryWindow(tk.Tk):
         self.preview_key = object()
         self.page_number = 0
         self.filter_button.configure(text="File type")
-        indexed = mode in ("versions", "live_ntfs", "ntfs_image", "bin", "folder")
+        indexed = mode in ("partitions", "versions", "live_ntfs", "ntfs_image", "bin", "folder")
 
         self.facet_mode.set("Folder" if indexed or self.pinned_folder else "Type")
         self.checked.clear()
@@ -1439,7 +1548,7 @@ class RecoveryWindow(tk.Tk):
                     scan_sectors(job, job.get("device") or source)
             elif job.get("deep_after_quick"):
                 self.scan_quick_and_deep(job, source)
-            elif job["mode"] in ("live_ntfs", "ntfs_image"):
+            elif job["mode"] in ("live_ntfs", "ntfs_image", "partitions"):
                 self.scan_indexed(job, source)
             else:
                 self.scan_image(job, source)
@@ -1538,7 +1647,7 @@ class RecoveryWindow(tk.Tk):
         scope = source if job["mode"] == "live_ntfs" else None
         if scope is not None and os.name != "nt":
             raise OSError("Live NTFS scans require Windows.")
-        volume = source_volume(scope) if scope is not None else str(source.resolve())
+        volume = source_volume(scope) if scope is not None else str(source)
         verified = False
         for entry in scan_ntfs(volume, scope, job):
             job["matches"].append((entry, entry.original))
@@ -1558,7 +1667,7 @@ class RecoveryWindow(tk.Tk):
                 self.next_render = monotonic() + (0.3 if self.sort.get() != "Discovery order" else 0)
             elapsed = elapsed_label(job["started"])
             records = job.get("records")
-            stage = {"versions": "Searching Windows shadow copies", "formatted": "Searching raw sectors for surviving file contents", "live_ntfs": "Reading NTFS file table", "ntfs_image": "Reading filesystem index",
+            stage = {"partitions": "Searching boot sectors and reading partition file tables", "versions": "Searching Windows shadow copies", "formatted": "Searching raw sectors for surviving file contents", "live_ntfs": "Reading NTFS file table", "ntfs_image": "Reading filesystem index",
                      "recover": "Carving disk image", "inspect": "Inspecting partition table",
                      "bin": "Reading Recycle Bin", "folder": "Reading Recycle Bin"}[job["mode"]]
             if job.get("raw_search") and job.get("only_free"):
@@ -1612,6 +1721,13 @@ class RecoveryWindow(tk.Tk):
         self.refresh_preview()
         self.refresh_thumbnails()
         self.refresh_save()
+        if not self.repair_events.empty():
+            output, description = self.repair_events.get_nowait()
+            self.repairing = False
+            if output:
+                messagebox.showinfo("Repaired copy saved", f"{output}\n\n{description}\n\nA preview decoded. Check the entire file for damage.", parent=self)
+            else:
+                messagebox.showerror("Media repair", description, parent=self)
         self.after(100, self.refresh)
 
     def consume_matches(self, job):
@@ -1642,7 +1758,7 @@ class RecoveryWindow(tk.Tk):
             if modified != "Unknown":
                 self.modified_years.add(modified[:4])
             if isinstance(path, Candidate):
-                self.checks[key] = "Deleted " + {"ntfs": "NTFS", "fat": "FAT", "exfat": "exFAT"}[path.filesystem] + " record"
+                self.checks[key] = "Unchecked" if path.allocated else "Deleted " + {"ntfs": "NTFS", "fat": "FAT", "exfat": "exFAT"}[path.filesystem] + " record"
             if self.job and self.job["mode"] in ("bin", "folder"):
                 self.checks[key] = "Emptied-bin record" if isinstance(path, Candidate) else "Retained in Recycle Bin"
             elif original is None:
@@ -1782,11 +1898,18 @@ class RecoveryWindow(tk.Tk):
             elif job["status"] == "failed" and clean.strip():
                 self.set_log(job.get("error", "") + "\n\n" + clean.strip())
 
-        if job["mode"] == "ntfs_image" and job["status"] == "complete":
+        if job["mode"] in ("ntfs_image", "partitions") and job["status"] == "complete":
             groups = Counter((entry.offset, entry.filesystem) for entry in self.files.values()
                              if isinstance(entry, Candidate) and entry.offset > 0)
+            if job.get("partition_search"):
+                found = job["valid_partitions"]
+                lost = sum(found.values())
+                self.set_scan_status(f"Partition search complete · {lost:,} lost partitions", color)
+                self.activity.configure(text=f"{lost:,} lost · {len(found) - lost:,} listed or whole-volume filesystems · {len(self.files):,} files")
+                for partition in found:
+                    groups.setdefault(partition, 0)
             if groups:
-                self.partition_notice(groups)
+                self.partition_notice(groups, job.get("valid_partitions"))
 
     def set_log(self, content):
         self.log.configure(state="normal")
@@ -2120,7 +2243,7 @@ class RecoveryWindow(tk.Tk):
         if key in self.snapshot_dates:
             return FILE_STATUSES[4]
         if isinstance(self.files[key], Candidate):
-            return FILE_STATUSES[1]
+            return FILE_STATUSES[5] if self.files[key].allocated else FILE_STATUSES[1]
         if key in self.originals:
             return FILE_STATUSES[2]
         return FILE_STATUSES[3]
@@ -2256,7 +2379,7 @@ class RecoveryWindow(tk.Tk):
                          values=("☑" if key in self.checked else "☐", str(path.parent) if key in self.originals else "",
                                  path.suffix.lstrip(".").upper(), size_label(self.metadata[key].st_size),
                                  self.file_date(key), {FILE_STATUSES[1]: "Deleted record", FILE_STATUSES[2]: "Still in bin",
-                                                       FILE_STATUSES[3]: "Raw scan", FILE_STATUSES[4]: "Shadow copy"}[self.file_status(key)], check), tags=(check, "alternate") if int(key) % 2 else (check,))
+                                                       FILE_STATUSES[3]: "Raw scan", FILE_STATUSES[4]: "Shadow copy", FILE_STATUSES[5]: "Lost partition"}[self.file_status(key)], check), tags=(check, "alternate") if int(key) % 2 else (check,))
 
     def change_page(self, delta):
         self.page_number += delta
@@ -2281,7 +2404,7 @@ class RecoveryWindow(tk.Tk):
             self.refresh_facets(render=False)
         self.size_button.configure(text=self.size_filter.get() if self.minimum_size else "File size")
         self.date_button.configure(text=("Snapshot date" if self.version_view else "Date modified") if self.active_modified == "All dates" else self.active_modified)
-        status_names = ("File status", "Deleted", "Still in bin", "Raw scan", "Shadow copy")
+        status_names = ("File status", "Deleted", "Still in bin", "Raw scan", "Shadow copy", "Lost partition")
         self.status_button.configure(text=status_names[FILE_STATUSES.index(self.active_status)])
         filters = [v for v in (self.extension, self.active_year)
                    if v not in ("All file types", "All dates")]
@@ -2731,25 +2854,26 @@ class RecoveryWindow(tk.Tk):
                 return area.left, area.top, area.right, area.bottom
         return 0, 0, self.winfo_screenwidth(), self.winfo_screenheight()
 
-    def partition_notice(self, groups):
+    def partition_notice(self, groups, discovered=None):
         active = self.grab_current()
         if active is not None:
             def show_after_close(event):
                 if event.widget == active:
-                    self.after_idle(self.partition_notice, groups)
+                    self.after_idle(self.partition_notice, groups, discovered)
             active.bind("<Destroy>", show_after_close, add="+")
             return
         dialog = self.modal("Partitions found")
-        tk.Label(dialog, text="Partitions with deleted files found", bg="#f6f9ff", fg=TEXT,
+        tk.Label(dialog, text="Filesystems found", bg="#f6f9ff", fg=TEXT,
                  font=("Segoe UI Semibold", 13)).pack(pady=(30, 6))
         tk.Label(dialog, text="Choose a folder in the Path view to explore the recovered names.",
                  bg="#f6f9ff", fg=MUTED).pack()
         tree = ttk.Treeview(dialog, show="tree", height=3)
         tree.pack(fill="both", expand=True, padx=48, pady=16)
         for (sector, fs), count in sorted(groups.items()):
-            node = tree.insert("", "end", text=f"{fs.upper()} partition at sector {sector:,}",
+            status = "Lost " if discovered and discovered.get((sector, fs)) else ""
+            node = tree.insert("", "end", text=f"{status}{fs.upper()} partition at sector {sector:,}",
                                image=self.icons["Folder"], open=True)
-            tree.insert(node, "end", text=f"{count:,} deleted files")
+            tree.insert(node, "end", text=f"{count:,} file entries")
         close = ttk.Button(dialog, text="Got it", style="Digger.TButton", command=dialog.destroy)
         close.pack(pady=(0, 16))
         self.wait_for_modal(dialog, 452, 300, close)
@@ -3009,6 +3133,9 @@ class RecoveryWindow(tk.Tk):
         self.set_scan_status("Canceling scan…", "#86500f")
 
     def close(self):
+        if self.repairing:
+            messagebox.showinfo("Media repair", "Wait for the repaired copy to finish saving.", parent=self)
+            return
         if self.saving:
             messagebox.showinfo("Recovery in progress", "Wait for the selected files to finish saving.")
             return
