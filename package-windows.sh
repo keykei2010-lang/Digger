@@ -53,6 +53,21 @@ strip_tool="$(dirname "$compiler")/x86_64-w64-mingw32-strip"
 for dll in libgcc_s_seh-1.dll libstdc++-6.dll libwinpthread-1.dll; do
   cp "$("$compiler" -print-file-name="$dll")" "$root/runtime/sleuthkit/"
 done
+# The standard upstream tools cannot perform Digger's indexed scan and preview.
+python3 - "$root/runtime/sleuthkit" <<'CHECK_TSK'
+from pathlib import Path
+import sys
+
+root = Path(sys.argv[1])
+for binary, markers in {
+    "fls": (b"MFT %llu %llu", b"seq:%u|"),
+    "istat": (b"The record status option requires NTFS.",),
+    "icat": (b"%llu %llu", b"Jb:f:hi:o:rRsvVP:B:k:S:"),
+}.items():
+    data = (root / (binary + ".exe")).read_bytes()
+    if any(marker not in data and marker.decode().encode("utf-16le") not in data for marker in markers):
+        raise SystemExit(f"{binary}.exe lacks the required Digger patches. Build the patched Sleuth Kit tools first.")
+CHECK_TSK
 cp "$inputs/mingw/usr/share/doc/gcc-mingw-w64-base/copyright" "$root/licenses/MinGW-GCC.txt"
 cp "$inputs/mingw/usr/share/doc/mingw-w64-common/copyright" "$root/licenses/MinGW-w64.txt"
 cp "$root/runtime/LICENSE.txt" "$root/licenses/Python.txt"

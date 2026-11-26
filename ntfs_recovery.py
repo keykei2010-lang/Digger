@@ -8,11 +8,10 @@ import os
 from pathlib import Path, PureWindowsPath
 import re
 import subprocess
-from tempfile import TemporaryFile
 from threading import Thread, Timer
 from recovery_output import atomic_output
 from server import LOCK
-from partition_search import boot_offsets
+from partition_search import boot_offsets, check_image_sector_size
 from windows_volumes import disk_number
 
 TOOLS = Path(__file__).resolve().parent / "runtime" / "sleuthkit"
@@ -61,7 +60,7 @@ def body_entry(line, source, offset, volume, fingerprint, filesystem="ntfs", inc
     marker, separator, name = header.partition("|/")
     has_sequence = filesystem == "ntfs" and re.fullmatch(r"seq:[0-9]{1,5}", marker)
     supported_inode = ENTRY_ID.fullmatch(inode) if filesystem == "ntfs" else re.fullmatch(r"[0-9]+", inode)
-    deleted = name.endswith(BODY_SUFFIX)
+    deleted = name.endswith(BODY_SUFFIX) and not include_existing
     if (not separator or (marker != "0" and not has_sequence) or (not deleted and not include_existing)
             or not supported_inode or not mode.startswith(("r/r", "-/r"))):
         return None
@@ -81,19 +80,26 @@ def body_entry(line, source, offset, volume, fingerprint, filesystem="ntfs", inc
 
 
 def partition_offsets(source, job):
-    with tool("mmls", ["-i", "raw", source], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as process:
+    with tool("mmls", ["-i", "raw", source], stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process:
         with LOCK:
             job["process"] = process
             if job["status"] == "stopping":
                 process.terminate()
         try:
-            output, _ = process.communicate(timeout=25)
+            output, errors = process.communicate(timeout=25)
         except subprocess.TimeoutExpired:
             process.kill()
-            output, _ = process.communicate()
+            process.communicate()
+            if job.get("partition_search"):
+                job["partition_table_note"] = "Reading the partition table timed out."
+                return []
+            raise OSError("Reading the partition table timed out.") from None
         finally:
             with LOCK:
                 job.pop("process", None)
+    if process.returncode and job["status"] != "stopping":
+        detail = errors.decode("utf-8", "replace").strip()
+        job["partition_table_note"] = detail[:500] or f"Partition reader exited with code {process.returncode}."
     return sorted({int(match[1]) for line in output.decode("utf-8", "replace").splitlines()
                    if (match := re.match(r"^\s*\d+:\s+[0-9]+(?::[0-9]+)?\s+(\d+)\s+\d+\s+\d+", line))
                    and int(match[1]) > 0})
@@ -120,6 +126,8 @@ def filesystem_at(source, offset):
 
 def scan(source, scope, job, include_bin_metadata=False):
     fingerprint = None if scope is not None or disk_number(source) is not None else identity(source)
+    if fingerprint is not None:
+        check_image_sector_size(source)
     offsets = [0] if scope is not None else [0, *partition_offsets(source, job)]
     known = set(offsets)
     if job.get("partition_search"):
@@ -130,17 +138,21 @@ def scan(source, scope, job, include_bin_metadata=False):
     readable = False
     messages = []
     seen = set()
-    for offset in offsets:
+    for offset, include_existing in ((sector, allocated) for sector in offsets
+                                     for allocated in ((False,) if sector in known else (True, False))):
         if job["status"] == "stopping":
             return
-        include_existing = offset not in known
-        filesystem = job.get("mounted_filesystem", "ntfs") if scope is not None else filesystem_at(source, offset)
+        is_lost = offset not in known
+        try:
+            filesystem = job.get("mounted_filesystem", "ntfs") if scope is not None else filesystem_at(source, offset)
+        except OSError as exc:
+            messages.append(f"Sector {offset:,}: {exc}")
+            continue
         if filesystem is None:
             continue
         errors = bytearray()
         arguments = ["-i", "raw", "-f", filesystem, "-o", str(offset), "-r", "-F", "-m", "/", source]
-        if not include_existing:
-            arguments.insert(0, "-d")
+        arguments.insert(0, "-u" if include_existing else "-d")
         if os.name == "nt" and filesystem == "ntfs" and not include_existing:
             arguments.insert(0, "-Q")
         with tool("fls", arguments, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process:
@@ -154,7 +166,7 @@ def scan(source, scope, job, include_bin_metadata=False):
                 job["process"] = process
                 if job["status"] == "stopping":
                     process.terminate()
-            volume = (scope.drive if scope is not None else f"Lost partition {offset}" if include_existing
+            volume = (scope.drive if scope is not None else f"Lost partition {offset}" if is_lost
                       else f"Partition-{offset}" if offset else "Image")
             for raw in process.stdout:
                 if raw.startswith(b"MFT "):
@@ -181,7 +193,7 @@ def scan(source, scope, job, include_bin_metadata=False):
         if not code:
             readable = True
             if job.get("partition_search"):
-                job["valid_partitions"][offset, filesystem] = include_existing
+                job["valid_partitions"][offset, filesystem] = is_lost
         else:
             messages.append(errors.decode("utf-8", "replace").strip())
     if job["status"] == "stopping":
@@ -194,6 +206,7 @@ def scan(source, scope, job, include_bin_metadata=False):
         detail = next((message for message in messages if message), "")
         hint = ("The NTFS reader could not finish reading the selected volume."
                 if scope is not None else "Choose a raw disk or volume image containing NTFS, FAT, or exFAT.")
+        detail = detail or job.get("partition_table_note", "")
         raise OSError("The filesystem scan did not finish. " + hint + ("\n" + detail if detail else ""))
 
 
@@ -301,9 +314,16 @@ def read_ntfs_record_status(entry, output, inode, attribute_id, virtual_name):
 def bitmap_prefix(source, offset, limit):
     with tool("icat", ["-i", "raw", "-f", "ntfs", "-o", str(offset), source, "6"],
               stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as process:
+        timeout = Timer(30, process.kill)
+        timeout.daemon = True
+        timeout.start()
         try:
-            return process.stdout.read(limit)
+            data = process.stdout.read(limit)
+            if len(data) < limit and process.wait():
+                raise OSError("Unable to read the NTFS allocation bitmap.")
+            return data
         finally:
+            timeout.cancel()
             if process.poll() is None:
                 process.kill()
 
@@ -327,7 +347,7 @@ def recovery_evidence(entry):
     check_identity(entry)
     if entry.filesystem != "ntfs":
         if entry.identity is not None:
-            return None, "Expected bytes read"
+            return None, "Payload allocation unchecked"
         args = ["-i", "raw", "-f", entry.filesystem, "-o", str(entry.offset), entry.source, entry.inode]
         with tool("istat", args, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process:
             try:
@@ -341,7 +361,7 @@ def recovery_evidence(entry):
         size_matches = re.search(rb"(?mi)^Size:\s*" + str(entry.st_size).encode() + rb"\s*$", record)
         if process.returncode or not match or match[0].strip() != expected or not size_matches:
             raise OSError("The FAT directory entry no longer matches the scan.")
-        return record, "Expected bytes read"
+        return record, "Payload allocation unchecked"
     record, runs = ntfs_record(entry)
     if isinstance(runs, str):
         return record, runs
@@ -368,23 +388,42 @@ def stream_recovery(entry, target):
     arguments = ["-i", "raw", "-f", entry.filesystem, "-o", str(entry.offset), entry.source, entry.inode]
     if not entry.allocated:
         arguments.insert(0, "-r")
-    with TemporaryFile() as errors, tool("icat", arguments, stdout=subprocess.PIPE, stderr=errors) as process:
+    with tool("icat", arguments, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process:
+        errors = bytearray()
+        def drain_errors():
+            for chunk in iter(lambda: process.stderr.read(4096), b""):
+                errors.extend(chunk[:max(0, 2048 - len(errors))])
+        reader = Thread(target=drain_errors)
+        reader.start()
         remaining = entry.st_size
+        # Bound a stalled read without limiting the total size of a healthy transfer.
         try:
-            for chunk in iter(lambda: process.stdout.read(1024 * 1024), b""):
+            while True:
+                timeout = Timer(60, process.kill)
+                timeout.daemon = True
+                timeout.start()
+                try:
+                    chunk = process.stdout.read(1024 * 1024)
+                finally:
+                    timeout.cancel()
+                if not chunk:
+                    break
                 if len(chunk) > remaining:
                     raise OSError("The recovered data exceeded the expected size.")
                 target.write(chunk)
                 remaining -= len(chunk)
-            result = process.wait()
+            result = process.wait(timeout=60)
+            reader.join()
             if result or remaining:
-                errors.seek(0)
-                detail = errors.read(2048).decode("utf-8", "replace").strip()
+                detail = errors.decode("utf-8", "replace").strip()
                 summary = f"The engine read {entry.st_size - remaining:,} of {entry.st_size:,} expected bytes."
                 raise OSError(summary + (f" {detail}" if detail else f" Engine exit code: {result}."))
+        except subprocess.TimeoutExpired:
+            raise OSError("The filesystem reader stalled after transferring the file.") from None
         finally:
             if process.poll() is None:
                 process.kill()
+            reader.join()
     if entry.identity is None:
         after, evidence = recovery_evidence(entry)
         if before != after:

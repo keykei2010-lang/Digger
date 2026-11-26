@@ -36,7 +36,7 @@ from windows_volumes import (check_volume_read_access, disk_geometry, disk_numbe
 
 from media_preview import IMAGE_TYPES, VIDEO_TYPES, TEXT_TYPES, decode_preview
 from recycle_bin import current_user_bins, emptied_items, ordinary, scan_recycle_bin
-from server import LOCK, RUNS, run_job
+from server import LOCK, run_job
 
 if os.name == "nt":
     runtime = Path(sys.executable).parent
@@ -69,6 +69,7 @@ CHECKS = {
     "Deleted NTFS record": (1, "#f4cb92"),
     "Deleted FAT record": (1, "#f4cb92"),
     "Deleted exFAT record": (1, "#f4cb92"),
+    "Payload allocation unchecked": (1, MUTED),
     "Expected bytes read": (2, "#acf0ca"),
     "Resident NTFS data": (2, "#acf0ca"),
     "NTFS clusters free": (2, "#acf0ca"),
@@ -438,6 +439,8 @@ class RecoveryWindow(tk.Tk):
         self.scan_area = tk.StringVar(value="Whole volume")
         self.scan_depth = tk.StringVar(value="Quick + deep")
         self.raw_source = None
+        self.protected_sources = set()
+        self.source_image = None
         self.output_folder = None
         self.page_number = 0
         self.page_size = 250
@@ -1290,7 +1293,7 @@ class RecoveryWindow(tk.Tk):
             launch = {True: "Running as administrator", False: "Standard launch", None: "Launch privileges unknown"}
             text = f"{launch[self.elevated]} · {text}"
         self.source_label.configure(text=text)
-        self.start_button.configure(state="normal" if ready and self.job is None and not self.saving else "disabled")
+        self.start_button.configure(state="normal" if ready and self.job is None and not self.saving and not self.repairing else "disabled")
 
     def choose_physical_disk(self):
         try:
@@ -1343,12 +1346,18 @@ class RecoveryWindow(tk.Tk):
                                               initialdir=str(Path(source).parent))
         if not destination:
             return
+        try:
+            self.validate_destination((), destination)
+        except OSError as exc:
+            messagebox.showerror("Media repair destination", str(exc), parent=self)
+            return
         self.repairing = True
+        self.update_source()
         self.show_admin_warning("Media repair started", "Digger is writing a separate repaired copy. A large video may take several minutes.")
         def work():
             try:
                 self.repair_events.put(repair_media(Path(source), Path(destination), Path(reference) if reference else None))
-            except (ValueError, OSError, RuntimeError, subprocess.SubprocessError) as exc:
+            except Exception as exc:
                 self.repair_events.put((None, str(exc)))
         threading.Thread(target=work, daemon=True).start()
 
@@ -1364,7 +1373,7 @@ class RecoveryWindow(tk.Tk):
             self.source_text.set(chosen)
 
     def start_scan(self, sample):
-        if self.job is not None or self.saving:
+        if self.job is not None or self.saving or self.repairing:
             return
         mode = self.mode.get()
         if mode in ("bin", "live_ntfs") and self.source_text.get() == "Recycle Bin":
@@ -1433,24 +1442,42 @@ class RecoveryWindow(tk.Tk):
                 else:
                     messagebox.showerror("Cannot read source drive", str(exc))
                 return
-        if sample:
-            location = filedialog.askdirectory(title="Choose a healthy drive for the 48 MiB recovery test")
+        protected = set()
+        if mode in ("live_ntfs", "formatted"):
+            protected.add(device)
+        elif physical:
+            protected.add(str(source))
+        elif mode == "versions":
+            protected.add("\\\\.\\" + source.drive)
+        elif mode in ("bin", "folder"):
+            protected.update("\\\\.\\" + root[:2] for root, _, _ in local_volumes()
+                             if mode == "bin" or root.casefold() == source.anchor.casefold())
+        if sample or mode == "inspect":
+            location = filedialog.askdirectory(parent=self, title="Choose a scratch folder for the recovery test" if sample
+                                               else "Choose a scratch folder for partition inspection")
             if not location:
                 return
             try:
-                scratch = tempfile.TemporaryDirectory(prefix="Digger-Test-", dir=location)
+                self.validate_destination((), location)
+                if mode == "inspect":
+                    require_separate_disk("\\\\.\\" + source.resolve().drive, Path(location).resolve(strict=True))
+                scratch = tempfile.TemporaryDirectory(prefix="Digger-Scan-", dir=location)
             except OSError as exc:
                 messagebox.showerror("Recovery test", str(exc))
                 return
             self.test_folders.append(scratch)
             folder = Path(scratch.name)
         else:
-            folder = Path(tempfile.mkdtemp(dir=RUNS.name))
+            folder = None
         self.deep_button.pack_forget()
         self.media_drive_button.pack_forget()
         has_raw_scan = mode == "formatted" or deep_after_quick
         self.raw_source = device if has_raw_scan else None
+        self.protected_sources = protected
+        self.source_image = source.resolve() if isinstance(source, Path) else None
         self.output_folder = None
+        self.last_recovery_report = None
+        self.recovery_details_button.pack_forget()
         self.open_output.pack_forget()
         self.pinned_folder = source if folder_deep else None
         if mode == "formatted":
@@ -1724,8 +1751,9 @@ class RecoveryWindow(tk.Tk):
         if not self.repair_events.empty():
             output, description = self.repair_events.get_nowait()
             self.repairing = False
+            self.update_source()
             if output:
-                messagebox.showinfo("Repaired copy saved", f"{output}\n\n{description}\n\nA preview decoded. Check the entire file for damage.", parent=self)
+                messagebox.showinfo("Repaired copy saved", f"{output}\n\n{description}\n\nVerification completed. Check the copy against the original where available.", parent=self)
             else:
                 messagebox.showerror("Media repair", description, parent=self)
         self.after(100, self.refresh)
@@ -1887,8 +1915,8 @@ class RecoveryWindow(tk.Tk):
         if is_bin and not self.files and job["status"] == "complete" and not bin_search:
             self.set_scan_status("Bin scan complete · No matches", color)
             self.set_log("This scan checked Recycle Bin records. Choose Deep scan a drive to look for surviving file contents.")
-        log = job["folder"] / "output.log"
-        if log.exists():
+        log = job["folder"] / "output.log" if job["folder"] else None
+        if log and log.exists():
             with log.open("rb") as stream:
                 stream.seek(max(0, log.stat().st_size - 16384))
                 text = stream.read().decode(errors="replace")
@@ -1905,7 +1933,13 @@ class RecoveryWindow(tk.Tk):
                 found = job["valid_partitions"]
                 lost = sum(found.values())
                 self.set_scan_status(f"Partition search complete · {lost:,} lost partitions", color)
-                self.activity.configure(text=f"{lost:,} lost · {len(found) - lost:,} listed or whole-volume filesystems · {len(self.files):,} files")
+                unreadable = job.get("unreadable_sectors", 0)
+                if unreadable:
+                    self.set_scan_status("Partition search partial", "#86500f")
+                self.activity.configure(text=f"{lost:,} lost · {len(found) - lost:,} listed or whole-volume filesystems · "
+                                             f"{len(self.files):,} files · {unreadable:,} unreadable sectors")
+                if job.get("partition_table_note") and "timed out" in job["partition_table_note"]:
+                    self.set_log(job["partition_table_note"] + "\nThe boot-sector search ran independently.")
                 for partition in found:
                     groups.setdefault(partition, 0)
             if groups:
@@ -2582,7 +2616,7 @@ class RecoveryWindow(tk.Tk):
         saved_path = self.materialized.get(key)
         suffix = (saved_path or display).suffix.lower()
         media = suffix in IMAGE_TYPES | VIDEO_TYPES | TEXT_TYPES
-        can_play = suffix in VIDEO_TYPES and (not isinstance(path, Candidate) or key in self.materialized)
+        can_play = suffix in VIDEO_TYPES and (isinstance(path, SectorFile) or key in self.materialized)
         self.open_button.configure(text="Play" if can_play else "Open preview", state="normal" if can_play else "disabled")
         self.preview.configure(text="Loading preview…" if media else "No media preview for this file type.")
         if media:
@@ -2733,22 +2767,8 @@ class RecoveryWindow(tk.Tk):
                 elif self.preview_bitmap is not None and self.preview_key == key:
                     self.preview_clicked()
                 return
-            if isinstance(path, Candidate):
-                output = self.materialized.get(key)
-                if output is None:
-                    if path.identity is None or path.st_size > 64 * 1024 * 1024:
-                        raise OSError("Recover this file before opening it.")
-                    folder = Path(tempfile.mkdtemp(dir=RUNS.name))
-                    output = folder / output_name(path.original.name)
-                    extract_ntfs(path, output)
-                path = output
-            elif key in self.originals and saved is None:
-                if not ordinary(path):
-                    raise OSError("The source item is no longer available.")
-                preview_dir = Path(tempfile.mkdtemp(dir=RUNS.name))
-                copy = preview_dir / self.originals[key].name
-                shutil.copyfile(path, copy)
-                path = copy
+            if saved is None and (isinstance(path, Candidate) or key in self.originals):
+                raise OSError("Recover this file to a separate disk before opening it in another app.")
             os.startfile(path)
         except (AttributeError, OSError) as exc:
             messagebox.showerror("Open file", f"Windows could not open this file. Check its default app.\n\n{exc}")
@@ -2781,6 +2801,7 @@ class RecoveryWindow(tk.Tk):
         live_sources = {entry.source for key in keys
                         if isinstance(entry := self.files[key], Candidate) and entry.identity is None}
         live_sources.update("\\\\.\\" + self.originals[key].drive for key in keys if key in self.snapshot_dates)
+        live_sources.update(self.protected_sources)
         if self.raw_source:
             live_sources.add(self.raw_source)
         for source in live_sources:
@@ -2796,7 +2817,9 @@ class RecoveryWindow(tk.Tk):
         destination = Path(name)
         try:
             self.validate_destination(self.files, destination.parent)
-            with destination.open("w", encoding="utf-8-sig", newline="") as stream:
+            if destination.exists() and self.source_image and destination.samefile(self.source_image):
+                raise OSError("Choose a report filename that does not refer to the source image.")
+            with atomic_output(destination) as pending, pending.open("w", encoding="utf-8-sig", newline="") as stream:
                 report = csv.writer(stream)
                 report.writerow(("Path", "Size (bytes)", "Date modified", "Date deleted", "Evidence", "Snapshot date"))
                 for key in self.files:
@@ -2881,6 +2904,8 @@ class RecoveryWindow(tk.Tk):
     def remember_destination(self, folder):
         self.last_destination = str(folder)
         try:
+            parent = next(path for path in (PREFERENCES.parent, *PREFERENCES.parents) if path.is_dir())
+            self.validate_destination((), parent)
             PREFERENCES.parent.mkdir(parents=True, exist_ok=True)
             with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=PREFERENCES.parent,
                                             delete=False) as pending:
@@ -3070,7 +3095,11 @@ class RecoveryWindow(tk.Tk):
             return
         self.materialized.update(materialized)
         self.thumb_tried.difference_update(materialized)
+        self.last_recovery_report = None
+        self.recovery_details_button.pack_forget()
         for key in materialized:
+            self.grid_thumbnails.pop(key, None)
+            self.thumbnails.pop(key, None)
             self.preview_errors.pop(key, None)
         self.recovery_checks.update(evidence)
         self.saving = False

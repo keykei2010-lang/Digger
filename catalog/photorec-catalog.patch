@@ -305,10 +305,10 @@
 +      unsigned int n=want-i<step?want-i:step;
 +      if(disk->pread(disk,buf+i,n,offset+i)!=(int)n) {
 +        memset(buf+i,0,n);
-+        if(i==0 || i+step==want) printf("DGREADERR\t%llu\n",(unsigned long long)(offset+i));
++        printf("DGREADERR\t%llu\n",(unsigned long long)(offset+i));
 +      }
 +    }
-+    puts("DGREADERR"); fflush(stdout);
++    fflush(stdout);
 +  }
 +}
 +

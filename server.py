@@ -1,4 +1,5 @@
 """Local UI for inspecting and recovering files from raw disk images."""
+from functools import lru_cache
 import json
 import mimetypes
 import os
@@ -27,9 +28,13 @@ def engine_path(name):
 
 
 SESSION = secrets.token_hex(16)
-RUNS = tempfile.TemporaryDirectory(prefix="digger-")
 JOBS = {}
 LOCK = threading.Lock()
+
+
+@lru_cache(maxsize=1)
+def browser_workspace():
+    return tempfile.TemporaryDirectory(prefix="digger-")
 PREVIEW = {"png", "jpg", "jpeg", "gif", "webp", "bmp"}
 
 
@@ -226,11 +231,11 @@ class Handler(BaseHTTPRequestHandler):
         if not os.access(engine_path(engine), os.X_OK):
             self.send_json({"error": f"The {engine} binary is unavailable."}, 503)
             return
-        if not sample and length > shutil.disk_usage(RUNS.name).free // 2:
+        if not sample and length > shutil.disk_usage(browser_workspace().name).free // 2:
             self.send_json({"error": "The image is too large for the available workspace storage."}, 413)
             return
         key = secrets.token_hex(12)
-        folder = Path(RUNS.name) / key
+        folder = Path(browser_workspace().name) / key
         folder.mkdir()
         image = folder / "source.img"
         try:

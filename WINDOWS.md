@@ -4,9 +4,9 @@ Extract the ZIP and run **Digger.exe**. The x64 desktop app runs offline. Keep t
 
 ## Recover from a missing partition or repair media
 
-- **Lost partitions** accepts a Windows physical disk or a raw disk image. It searches surviving NTFS, FAT and exFAT boot sectors and lists files under each discovered partition. Existing table entries still supply deleted-file results. Physical disks need administrator access and 512-byte logical sectors. The search reads the source without replacing any partition-table entries. Save files to a separate physical disk.
+- **Lost partitions** accepts a Windows physical disk or a raw disk image. It searches surviving NTFS, FAT and exFAT boot sectors and lists files under each discovered partition. Existing table entries still supply deleted-file results. Physical disks need administrator access and 512-byte logical sectors. The search reads the source without replacing any partition-table entries. Save files to a separate physical disk. On damaged media, the partition search skips unreadable sectors and reports partial coverage.
 - **Hardware disk** also supports deleted-file scans of mounted FAT and exFAT volumes. Select **Deep Scan** separately if you need a sector scan.
-- **Repair media…** opens damaged MP4, MOV, M4V, 3GP, AVI, JPEG or PNG files. For a missing MP4 index, the repair engine looks for surviving H.264 or H.265 frames and can use a healthy reference clip from the same camera and settings. Digger writes a separate repaired copy and checks that a preview decodes. Check playback through the whole clip to see how much survived.
+- **Repair media…** opens damaged MP4, MOV, M4V, 3GP, AVI, JPEG or PNG files. For a missing MP4 index, the repair engine looks for surviving H.264 or H.265 frames and can use a healthy reference clip from the same camera and settings. Digger publishes a separate repaired copy after decoding its video and audio streams. Some damaged formats and nested AVI layouts are declined when safe reconstruction is unavailable. Check playback through the whole clip to see how much survived.
 
 ## Choose a scan
 

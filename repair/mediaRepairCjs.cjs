@@ -668,13 +668,14 @@ function repairMp4StreamingFileCjs(srcPath, dstPath, referenceBuf) {
       if (sz === 1 && nRead >= 16) {
         sz = hdrBuf.readUInt32BE(8) * 4294967296 + hdrBuf.readUInt32BE(12);
         hSz = 16;
+      } else if (sz === 1) {
+        break;
       } else if (sz === 0) {
         sz = fileSize - pos;
         boxes.push({ type: tp, offset: pos, size: sz, headerSize: hSz });
-        truncatedAt = pos;
         break;
       }
-      if (sz < 8) break;
+      if (!Number.isSafeInteger(sz) || sz < hSz) break;
       if (pos + sz > fileSize) {
         boxes.push({ type: tp, offset: pos, size: fileSize - pos, headerSize: hSz });
         truncatedAt = pos;
@@ -691,15 +692,20 @@ function repairMp4StreamingFileCjs(srcPath, dstPath, referenceBuf) {
     // If moov exists and trailing box size is truncated, stream-copy + patch tail box header
     if (hasMoov) {
       if (truncatedAt === null) {
-        return { ok: false, note: 'MP4 moov index already intact.' };
+        return { ok: false, note: 'An MP4 index is already present and no trailing atom overrun was found.' };
       }
+      const tail = boxes[boxes.length - 1];
       const dstFd = fs.openSync(dstPath, 'w');
       try {
         const win = new SlidingFdWindow(srcFd, 0, fileSize, 4 * 1024 * 1024);
         win.copyToFd(dstFd, 0, fileSize);
-        const fixSz = Buffer.allocUnsafe(4);
-        fixSz.writeUInt32BE(Math.max(8, fileSize - truncatedAt) >>> 0, 0);
-        fs.writeSync(dstFd, fixSz, 0, 4, truncatedAt);
+        const fixSz = Buffer.alloc(tail.headerSize === 16 ? 8 : 4);
+        if (tail.headerSize === 16) {
+          fixSz.writeBigUInt64BE(BigInt(tail.size));
+        } else {
+          fixSz.writeUInt32BE(tail.size);
+        }
+        fs.writeSync(dstFd, fixSz, 0, fixSz.length, truncatedAt + (tail.headerSize === 16 ? 8 : 0));
       } finally {
         fs.closeSync(dstFd);
       }
@@ -712,7 +718,7 @@ function repairMp4StreamingFileCjs(srcPath, dstPath, referenceBuf) {
     let recoveredHeaderless = false;
 
     if (mdatBoxes.length > 0) {
-      if (ftypBox) {
+      if (ftypBox && ftypBox.size <= 65536) {
         ftypBuf = Buffer.allocUnsafe(ftypBox.size);
         fs.readSync(srcFd, ftypBuf, 0, ftypBox.size, ftypBox.offset);
       } else {
@@ -793,6 +799,27 @@ function repairMp4StreamingFileCjs(srcPath, dstPath, referenceBuf) {
       const videoSamples = [];
       const audioSamples = [];
       let outCursor = 0;
+      const sampleLimit = 1_000_000;
+
+      function addVideoSlice(reader, start, length, keyframe) {
+        const headerSize = codec === 'hevc' ? 2 : 1;
+        if (length <= headerSize) throw new Error('Incomplete video slice header.');
+        const header = reader.readSlice(start + headerSize, Math.min(32, length - headerSize));
+        const firstSlice = codec === 'hevc'
+          ? Boolean(header[0] & 0x80)
+          : new BitReaderCjs(stripEmulationBytesCjs(header)).readUE() === 0;
+        if (firstSlice) {
+          videoSamples.push({ offset: outCursor, size: 4 + length, isKey: keyframe });
+        } else {
+          const previous = videoSamples[videoSamples.length - 1];
+          if (!previous || previous.offset + previous.size !== outCursor ||
+              previous.isKey !== keyframe) {
+            throw new Error('A frame has missing or separated slices.');
+          }
+          previous.size += 4 + length;
+        }
+      }
+
 
       for (const span of payloadSpans) {
         if (span.end <= span.start) continue;
@@ -828,6 +855,9 @@ function repairMp4StreamingFileCjs(srcPath, dstPath, referenceBuf) {
         let cur = span.start;
         let spanVideoHits = 0;
         while (cur + 5 <= span.end) {
+          if (videoSamples.length + audioSamples.length >= sampleLimit) {
+            throw new Error('Repair exceeded the sample-index limit.');
+          }
           const adts = isLikelyAdtsAtReader(win, cur, span.end);
           if (adts) {
             const hLen = (win.byteAt(cur + 1) & 0x01) === 0 ? 9 : 7;
@@ -859,7 +889,7 @@ function repairMp4StreamingFileCjs(srcPath, dstPath, referenceBuf) {
                 else if (ht === 34 && !pps && nalLen <= 4096) pps = win.readSlice(cur + 4, nalLen);
                 win.copyToFd(dstFd, cur, 4 + nalLen);
                 if (ht <= 21) {
-                  videoSamples.push({ offset: outCursor, size: 4 + nalLen, isKey: ht >= 16 && ht <= 21 });
+                  addVideoSlice(win, cur + 4, nalLen, ht >= 16 && ht <= 21);
                 }
                 outCursor += 4 + nalLen;
                 cur += 4 + nalLen;
@@ -873,7 +903,7 @@ function repairMp4StreamingFileCjs(srcPath, dstPath, referenceBuf) {
                 else if (nt === 8 && !pps && nalLen <= 4096) pps = win.readSlice(cur + 4, nalLen);
                 win.copyToFd(dstFd, cur, 4 + nalLen);
                 if (nt === 5 || nt === 1) {
-                  videoSamples.push({ offset: outCursor, size: 4 + nalLen, isKey: nt === 5 });
+                  addVideoSlice(win, cur + 4, nalLen, nt === 5);
                 }
                 outCursor += 4 + nalLen;
                 cur += 4 + nalLen;
@@ -950,7 +980,7 @@ function repairMp4StreamingFileCjs(srcPath, dstPath, referenceBuf) {
           const spanLen = span.end - span.start;
           const scanLim = span.start + Math.min(spanLen, 192 * 1024 * 1024);
           let scOffsets = [];
-          for (let i = span.start; i + 4 <= scanLim; i++) {
+          for (let i = span.start; i + 4 <= scanLim && scOffsets.length < sampleLimit; i++) {
             const b0 = win.byteAt(i);
             if (b0 === 0 && win.byteAt(i + 1) === 0) {
               const b2 = win.byteAt(i + 2);
@@ -962,6 +992,9 @@ function repairMp4StreamingFileCjs(srcPath, dstPath, referenceBuf) {
                 i += 2;
               }
             }
+          }
+          if (scOffsets.length >= sampleLimit - videoSamples.length - audioSamples.length) {
+            throw new Error('Repair exceeded the sample-index limit.');
           }
           if (scOffsets.length > 0) {
             if (!refVideo) {
@@ -991,12 +1024,12 @@ function repairMp4StreamingFileCjs(srcPath, dstPath, referenceBuf) {
                 if (ht === 32 && !vps && nLen <= 4096) vps = win.readSlice(nStart, nLen);
                 if (ht === 33 && !sps && nLen <= 4096) sps = win.readSlice(nStart, nLen);
                 if (ht === 34 && !pps && nLen <= 4096) pps = win.readSlice(nStart, nLen);
-                if (ht <= 21) videoSamples.push({ offset: outCursor, size: 4 + nLen, isKey: ht >= 16 && ht <= 21 });
+                if (ht <= 21) addVideoSlice(win, nStart, nLen, ht >= 16 && ht <= 21);
               } else {
                 const nt = fb & 0x1f;
                 if (nt === 7 && !sps && nLen <= 4096) sps = win.readSlice(nStart, nLen);
                 if (nt === 8 && !pps && nLen <= 4096) pps = win.readSlice(nStart, nLen);
-                if (nt === 5 || nt === 1) videoSamples.push({ offset: outCursor, size: 4 + nLen, isKey: nt === 5 });
+                if (nt === 5 || nt === 1) addVideoSlice(win, nStart, nLen, nt === 5);
               }
               outCursor += 4 + nLen;
             }
@@ -1109,6 +1142,7 @@ function repairMp4StreamingFileCjs(srcPath, dstPath, referenceBuf) {
         ok: true,
         tier: 'structural-moov',
         videoSamples: videoSamples.length,
+        videoSeconds: videoDuration / timescale,
         audioSamples: audioSamples.length,
         note: `Streaming MOOV rebuild recovered ${videoSamples.length} ${codecLabel} frames @ ${width}×${height}${audNote}${hdrNote}.`,
       };
@@ -1414,6 +1448,9 @@ function repairAviBufferCjs(rawBuf) {
   while (cp + 8 <= patched.length) {
     const tag = patched.toString('ascii', cp, cp + 4);
     if (tag === 'idx1') break;
+    if (tag === 'LIST' || tag === 'RIFF' || tag === 'JUNK') {
+      return { note: 'AVI has nested or non-frame chunks. This repair cannot rebuild it safely.' };
+    }
     const cl = patched.readUInt32LE(cp + 4);
     if (!/^[0-9]{2}[a-zA-Z]{2}$/.test(tag) || cp + 8 + cl > patched.length) break;
     const isVid = tag.endsWith('dc') || tag.endsWith('db');
@@ -1423,6 +1460,7 @@ function repairAviBufferCjs(rawBuf) {
     lastValid = Math.min(patched.length, next);
     cp = next;
   }
+  if (!frames) return { note: 'AVI repair found no complete video chunks.' };
   if (avihOff > 0 && avihOff + 20 <= patched.length && frames > 0) patched.writeUInt32LE(frames, avihOff + 16);
   patched.writeUInt32LE(Math.max(4, lastValid - moviBase) >>> 0, moviOffset + 4);
   const idxBuf = idx.length > 0 ? Buffer.allocUnsafe(8 + idx.length * 16) : Buffer.alloc(0);

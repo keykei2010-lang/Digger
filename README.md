@@ -14,3 +14,5 @@ Deep scans index the source in place. Preview results and choose the files to re
 - The repository also contains the local browser interface used during earlier development. The Windows desktop launcher runs independently of it.
 
 The portable build includes separate third-party engines with their upstream license and source notices.
+
+Before distributing a Windows ZIP, extract it and run `tests/windows_package_smoke.py` with its bundled `runtime/python.exe`, passing the extracted Digger folder as the script’s argument. The test checks indexed NTFS discovery, a byte-range preview, and the recovered file’s SHA-256. Test native Windows devices separately.

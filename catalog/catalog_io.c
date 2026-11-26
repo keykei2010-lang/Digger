@@ -81,6 +81,8 @@ size_t catalog_read(void *out, size_t size, size_t count, FILE *stream)
       if(n>avail) n=(unsigned int)avail;
       if(n>length-pos) n=(unsigned int)(length-pos);
       if(medium->pread(medium,(unsigned char*)out+done,n,run->start+within)!=(int)n) {
+        printf("DGREADERR\t%llu\n", (unsigned long long)(run->start + within));
+        fflush(stdout);
         at_eof=1;
         return done/size;
       }
